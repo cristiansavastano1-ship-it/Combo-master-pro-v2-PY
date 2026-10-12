@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 from scipy.optimize import minimize, minimize_scalar
-from scipy.stats import poisson
+from scipy.special import gammaln
 
 # --- CONFIGURAZIONE PAGINA ---
 st.set_page_config(
@@ -111,6 +111,8 @@ UA = {"User-Agent": "Mozilla/5.0"}
 N_STAGIONI = 3
 COL_PRESA = [("AvgH", "AvgD", "AvgA"), ("B365H", "B365D", "B365A"), ("PSH", "PSD", "PSA"), ("MaxH", "MaxD", "MaxA")]
 COL_CHIUSURA = [("PSCH", "PSCD", "PSCA"), ("AvgCH", "AvgCD", "AvgCA"), ("B365CH", "B365CD", "B365CA")]
+COL_OU_PRESA = [("Avg>2.5", "Avg<2.5"), ("B365>2.5", "B365<2.5"), ("P>2.5", "P<2.5"), ("Max>2.5", "Max<2.5")]
+COL_OU_CHIUSURA = [("AvgC>2.5", "AvgC<2.5"), ("PC>2.5", "PC<2.5"), ("B365C>2.5", "B365C<2.5")]
 STAT_COLONNE = {"Tiri": ("HS", "AS"), "Tiri in Porta": ("HST", "AST"), "Corner": ("HC", "AC"), "Falli": ("HF", "AF")}
 
 _STOP_NOMI = {"fc", "ac", "as", "cf", "afc", "acf", "ssc", "us", "ud", "rc", "rcd", "sv", "vfl", "vfb", "fsv", "tsg",
@@ -341,9 +343,16 @@ def lambda_partita(m, casa, trasf):
     return math.exp(m["mu"] + m["hm"] + ac + dt), math.exp(m["mu"] + at + dc)
 
 
+_K = np.arange(11)
+_LOGFACT = gammaln(_K + 1)
+
+
+def _pmf(lam):
+    return np.exp(-lam + _K * np.log(lam) - _LOGFACT)
+
+
 def matrice_punteggi(lh, la, rho, mg=10):
-    k = np.arange(mg + 1)
-    M = np.outer(poisson.pmf(k, lh), poisson.pmf(k, la))
+    M = np.outer(_pmf(lh), _pmf(la))
     if rho != 0:
         M[0, 0] *= max(1 - lh * la * rho, 1e-6)
         M[0, 1] *= max(1 + lh * rho, 1e-6)
@@ -469,7 +478,7 @@ def parametri_auto(div, giorno):
         for h_ in (180, 365, 730, 0):
             bt = esegui_backtest_df(df, r_, h_, True, 28)
             if not bt.empty:
-                ricerca.append({"Shrinkage λ": r_, "Emivita (gg)": h_ if h_ else "nessuna",
+                ricerca.append({"Shrinkage λ": r_, "Emivita (gg)": str(h_) if h_ else "nessuna",
                                 "Log loss": round(metriche_backtest(bt)["modello"][0], 4), "_r": r_, "_h": h_})
     if not ricerca:
         return default
@@ -490,6 +499,205 @@ def modello_corrente(div, ridge, halflife, giorno):
 def backtest_cached(div, ridge, halflife, passo, giorno):
     df = carica_storico(div, N_STAGIONI, giorno)
     return None if df is None else esegui_backtest_df(df, ridge, halflife, True, passo)
+
+
+# ======================= TEST COMPLETO (GOAL, OVER/UNDER, RISULTATI ESATTI) =======================
+_I, _J = np.meshgrid(np.arange(11), np.arange(11), indexing="ij")
+_MASK = {"p1": _I > _J, "px": _I == _J, "p2": _I < _J, "over1.5": (_I + _J) > 1.5, "over2.5": (_I + _J) > 2.5,
+         "over3.5": (_I + _J) > 3.5, "btts": (_I > 0) & (_J > 0)}
+VARIANTI_MODELLO = ["Modello", "Senza Dixon-Coles", "Ancorato al mercato", "Misto 50/50"]
+VARIANTI = VARIANTI_MODELLO + ["Frequenze storiche"]
+
+
+def prima_coppia(riga, colonne):
+    for a, b in colonne:
+        try:
+            v = [float(riga[a]), float(riga[b])]
+        except (KeyError, TypeError, ValueError):
+            continue
+        if all(np.isfinite(v)) and all(x > 1.0 for x in v):
+            return v
+    return None
+
+
+def matrice_ancorata(p1x2, p_over25, rho, start):
+    """Gol attesi ricavati dalle quote (1X2 ed eventualmente Over/Under 2.5), poi distribuzione completa dei punteggi."""
+    def err(th):
+        mk = mercati(matrice_punteggi(math.exp(th[0]), math.exp(th[1]), rho))
+        e = (mk["p1"] - p1x2[0]) ** 2 + (mk["px"] - p1x2[1]) ** 2 + (mk["p2"] - p1x2[2]) ** 2
+        if p_over25 is not None:
+            e += (mk["over2.5"] - p_over25) ** 2
+        return e
+    res = minimize(err, np.log(np.asarray(start, float)), method="Nelder-Mead", options={"xatol": 1e-3, "fatol": 1e-10, "maxiter": 250})
+    return matrice_punteggi(math.exp(res.x[0]), math.exp(res.x[1]), rho)
+
+
+def esegui_test_completo(df, ridge, halflife, passo):
+    """Walk-forward come il backtest, ma conserva l'intera distribuzione dei punteggi di ogni variante."""
+    stagioni = sorted(df["Stag"].unique())
+    if len(stagioni) < 2:
+        return None
+    t = df.loc[df["Stag"] == stagioni[1], "Date"].min()
+    fine = df["Date"].max()
+    nan_m = np.full((11, 11), np.nan)
+    rec = {"Partita": [], "xs": [], "ys": [], "ok": [], "ou_ok": [], "m1x2": [], "mou": [], "min_storia": []}
+    Ms = {v: [] for v in VARIANTI}
+    while t <= fine:
+        blocco = df[(df["Date"] >= t) & (df["Date"] < t + pd.Timedelta(days=passo))]
+        train = df[df["Date"] < t]
+        if len(blocco) and len(train) >= 150:
+            m = adatta_modello(train, t, ridge, halflife, True)
+            cnt = pd.concat([train["HomeTeam"], train["AwayTeam"]]).value_counts()
+            cm = np.zeros((11, 11))
+            np.add.at(cm, (np.minimum(train["FTHG"].to_numpy(), 10), np.minimum(train["FTAG"].to_numpy(), 10)), 1)
+            m_freq = (cm + 0.05) / (cm.sum() + 0.05 * 121)
+            for _, r in blocco.iterrows():
+                h, a = r["HomeTeam"], r["AwayTeam"]
+                lh, la = lambda_partita(m, h, a)
+                Mb = matrice_punteggi(lh, la, m["rho"])
+                Mn = matrice_punteggi(lh, la, 0.0)
+                qp, qo = prima_tripla(r, COL_PRESA), prima_coppia(r, COL_OU_PRESA)
+                if qp:
+                    p_o = float(senza_margine(qo)[0]) if qo else None
+                    Ma = matrice_ancorata(senza_margine(qp), p_o, m["rho"], (lh, la))
+                    Mx = 0.5 * (Mb + Ma)
+                else:
+                    Ma = Mx = nan_m
+                qc, qoc = prima_tripla(r, COL_CHIUSURA), prima_coppia(r, COL_OU_CHIUSURA)
+                rec["Partita"].append(f"{h} - {a}")
+                rec["xs"].append(min(int(r["FTHG"]), 10))
+                rec["ys"].append(min(int(r["FTAG"]), 10))
+                rec["ok"].append(bool(qp))
+                rec["ou_ok"].append(bool(qp and qoc))
+                rec["m1x2"].append(senza_margine(qc) if qc else np.full(3, np.nan))
+                rec["mou"].append(float(senza_margine(qoc)[0]) if qoc else np.nan)
+                rec["min_storia"].append(int(min(cnt.get(h, 0), cnt.get(a, 0))))
+                for nome, Mv in zip(VARIANTI, (Mb, Mn, Ma, Mx, m_freq)):
+                    Ms[nome].append(Mv)
+        t += pd.Timedelta(days=passo)
+    if not rec["xs"]:
+        return None
+    out = {k: np.array(v) for k, v in rec.items() if k != "Partita"}
+    out["Partita"] = rec["Partita"]
+    out["Ms"] = {k: np.array(v) for k, v in Ms.items()}
+    return out
+
+
+def _p_mercato(Ms, chiave):
+    return (Ms * _MASK[chiave]).sum(axis=(1, 2))
+
+
+def _ll_bin(p, o):
+    p = np.clip(p, 1e-9, 1 - 1e-9)
+    return float(-np.mean(o * np.log(p) + (1 - o) * np.log(1 - p)))
+
+
+def _ll_1x2(P, y):
+    return float(-np.mean(np.log(np.clip(P[np.arange(len(y)), y], 1e-9, 1))))
+
+
+def tabelle_test(res):
+    xs, ys, ok, ou_ok = res["xs"], res["ys"], res["ok"], res["ou_ok"]
+    esito = np.where(xs > ys, 0, np.where(xs == ys, 1, 2))
+    outc = {"over1.5": (xs + ys > 1.5).astype(float), "over2.5": (xs + ys > 2.5).astype(float),
+            "over3.5": (xs + ys > 3.5).astype(float), "btts": ((xs > 0) & (ys > 0)).astype(float)}
+    mercati_def = [("1X2", "1x2"), ("Over/Under 1.5", "over1.5"), ("Over/Under 2.5", "over2.5"),
+                   ("Over/Under 3.5", "over3.5"), ("Goal / No Goal", "btts"), ("Risultato esatto (log score)", "exact")]
+    righe, migliore = [], {}
+    for etichetta, mk in mercati_def:
+        sel = ok.copy()
+        if mk == "over2.5":
+            sel = ou_ok.copy()
+        if mk == "1x2":
+            sel = ok & ~np.isnan(res["m1x2"]).any(axis=1)
+        if sel.sum() < 10:
+            continue
+        r = {"Mercato": etichetta, "Partite": int(sel.sum())}
+        for v in VARIANTI:
+            Mv = res["Ms"][v][sel]
+            if mk == "1x2":
+                val = _ll_1x2(np.stack([_p_mercato(Mv, "p1"), _p_mercato(Mv, "px"), _p_mercato(Mv, "p2")], axis=1), esito[sel])
+            elif mk == "exact":
+                val = float(-np.mean(np.log(np.clip(Mv[np.arange(len(Mv)), xs[sel], ys[sel]], 1e-12, 1))))
+            else:
+                val = _ll_bin(_p_mercato(Mv, mk), outc[mk][sel])
+            r[v] = round(val, 4)
+        if mk == "1x2":
+            r["Mercato (chiusura)"] = round(_ll_1x2(res["m1x2"][sel], esito[sel]), 4)
+        elif mk == "over2.5":
+            r["Mercato (chiusura)"] = round(_ll_bin(res["mou"][sel], outc["over2.5"][sel]), 4)
+        else:
+            r["Mercato (chiusura)"] = None
+        best = min(VARIANTI_MODELLO, key=lambda v: r[v])
+        r["Migliore"] = best
+        migliore[mk] = best
+        righe.append(r)
+    tab_a = pd.DataFrame(righe)
+
+    # Presi e non presi per soglia di fiducia
+    righe_b = []
+    sel = ok
+    for etichetta, mk, lato in [("Goal", "btts", 1), ("No Goal", "btts", 0), ("Over 1.5", "over1.5", 1), ("Under 1.5", "over1.5", 0),
+                                ("Over 2.5", "over2.5", 1), ("Under 2.5", "over2.5", 0), ("Over 3.5", "over3.5", 1), ("Under 3.5", "over3.5", 0)]:
+        v = migliore.get(mk, "Modello")
+        p = _p_mercato(res["Ms"][v][sel], mk)
+        p = p if lato == 1 else 1 - p
+        hit = (outc[mk][sel] == lato)
+        for thr in (55, 65, 75):
+            s_ = p >= thr / 100
+            if s_.sum() >= 5:
+                righe_b.append({"Mercato": etichetta, "Soglia %": thr, "Variante": v, "Selezioni": int(s_.sum()),
+                                "Presi %": round(hit[s_].mean() * 100, 1), "Prob. dichiarata %": round(p[s_].mean() * 100, 1)})
+    v1 = migliore.get("1x2", "Modello")
+    P1 = np.stack([_p_mercato(res["Ms"][v1][sel], k_) for k_ in ("p1", "px", "p2")], axis=1)
+    for i, nome in enumerate(["1 (Casa)", "X (Pareggio)", "2 (Trasferta)"]):
+        for thr in (45, 55, 65):
+            s_ = P1[:, i] >= thr / 100
+            if s_.sum() >= 5:
+                righe_b.append({"Mercato": nome, "Soglia %": thr, "Variante": v1, "Selezioni": int(s_.sum()),
+                                "Presi %": round((esito[sel][s_] == i).mean() * 100, 1), "Prob. dichiarata %": round(P1[s_, i].mean() * 100, 1)})
+    tab_b = pd.DataFrame(righe_b)
+
+    # Risultati esatti: presi e non presi
+    righe_c = []
+    for v in VARIANTI:
+        Mv = res["Ms"][v][ok].reshape(ok.sum(), -1)
+        ordine = np.argsort(-Mv, axis=1)[:, :3]
+        reale = xs[ok] * 11 + ys[ok]
+        righe_c.append({"Variante": v, "Log score": round(float(-np.mean(np.log(np.clip(Mv[np.arange(len(Mv)), reale], 1e-12, 1)))), 4),
+                        "1° esatto preso %": round((ordine[:, 0] == reale).mean() * 100, 1),
+                        "Nei primi 3 %": round((ordine == reale[:, None]).any(axis=1).mean() * 100, 1),
+                        "Prob. media del 1° %": round(float(np.take_along_axis(Mv, ordine[:, :1], 1).mean() * 100), 1)})
+    tab_c = pd.DataFrame(righe_c)
+    best_ex = min(VARIANTI_MODELLO, key=lambda v: float(tab_c.loc[tab_c["Variante"] == v, "Log score"].iloc[0]))
+    idx = np.where(ok)[0][-25:]
+    Mv = res["Ms"][best_ex]
+    righe_d = []
+    for i in idx[::-1]:
+        flat = Mv[i].ravel()
+        top = np.argsort(-flat)[:3]
+        reale = xs[i] * 11 + ys[i]
+        stato = "✅ preso (1°)" if top[0] == reale else ("🟡 nei primi 3" if reale in top else "❌ non preso")
+        righe_d.append({"Partita": res["Partita"][i],
+                        "1°": f"{top[0]//11}-{top[0]%11} ({flat[top[0]]*100:.0f}%)", "2°": f"{top[1]//11}-{top[1]%11} ({flat[top[1]]*100:.0f}%)",
+                        "3°": f"{top[2]//11}-{top[2]%11} ({flat[top[2]]*100:.0f}%)",
+                        "Risultato": f"{xs[i]}-{ys[i]}", "Esito": stato})
+    tab_d = pd.DataFrame(righe_d)
+
+    # Squadre con poca storia (neopromosse): errore 1X2 del modello base
+    Pb = np.stack([_p_mercato(res["Ms"]["Modello"], k_) for k_ in ("p1", "px", "p2")], axis=1)
+    righe_e = []
+    for nome, sel_e in [("Squadra con meno di 15 partite di storico", res["min_storia"] < 15),
+                        ("Tutte le altre", res["min_storia"] >= 15)]:
+        if sel_e.sum() >= 5:
+            righe_e.append({"Gruppo": nome, "Partite": int(sel_e.sum()), "Log loss 1X2 (Modello)": round(_ll_1x2(Pb[sel_e], esito[sel_e]), 4)})
+    return tab_a, tab_b, tab_c, tab_d, pd.DataFrame(righe_e), best_ex
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def test_completo_cached(div, ridge, halflife, passo, giorno):
+    df = carica_storico(div, N_STAGIONI, giorno)
+    return None if df is None else esegui_test_completo(df, ridge, halflife, passo)
 
 
 # ======================= STATISTICHE, CLASSIFICA =======================
@@ -829,6 +1037,33 @@ with tab_backtest:
             st.plotly_chart(figc, use_container_width=True)
     elif bt is not None:
         st.warning("Backtest vuoto: servono almeno 2 stagioni di dati.")
+
+    st.markdown("---")
+    st.markdown("### 🔬 Test completo: Goal/No Goal, Over/Under e Risultati Esatti")
+    st.caption("Confronta più varianti sulle stesse partite, sempre walk-forward: Modello, Senza Dixon-Coles, Ancorato al mercato "
+               "(gol attesi ricavati dalle quote 1X2 e Over/Under 2.5 prima della partita), Misto 50/50 e Frequenze storiche. "
+               "Valori più bassi = meglio. Serve a capire cosa migliorare: non cambia le previsioni dell'app.")
+    if st.button("🧪 Esegui test completo"):
+        with st.spinner("Calcolo in corso (può richiedere un minuto)..."):
+            st.session_state["tc"] = test_completo_cached(div, par["ridge"], par["halflife"], 14, giorno)
+            st.session_state["tc_div"] = div
+    tc = st.session_state.get("tc") if st.session_state.get("tc_div") == div else None
+    if tc is not None:
+        tab_a, tab_b, tab_c, tab_d, tab_e, best_ex = tabelle_test(tc)
+        st.markdown("#### 📏 Qualità per mercato (log loss, più basso è meglio)")
+        st.dataframe(tab_a, use_container_width=True, hide_index=True)
+        st.caption("Per Risultato esatto il valore è il log score del punteggio reale. 'Mercato (chiusura)' è il riferimento delle quote senza margine, "
+                   "disponibile solo per 1X2 e Over/Under 2.5; per Goal/No Goal e risultati esatti non ci sono quote nei dati.")
+        st.markdown("#### ✅ Presi e non presi: quando il modello è sicuro, quante volte ha ragione")
+        st.dataframe(tab_b, use_container_width=True, hide_index=True)
+        st.caption("Se 'Presi %' è molto sotto 'Prob. dichiarata %', il modello è troppo ottimista a quella soglia.")
+        st.markdown("#### 🎯 Risultati esatti: presi e non presi")
+        st.dataframe(tab_c, use_container_width=True, hide_index=True)
+        st.markdown(f"Ultime 25 partite con la variante migliore sui risultati esatti ({best_ex}):")
+        st.dataframe(tab_d, use_container_width=True, hide_index=True)
+        if not tab_e.empty:
+            st.markdown("#### 🆕 Squadre con poca storia (neopromosse)")
+            st.dataframe(tab_e, use_container_width=True, hide_index=True)
 
 # --- VALUE BET (KELLY) ---
 with tab_kelly:
