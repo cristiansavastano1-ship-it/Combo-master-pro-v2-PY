@@ -180,13 +180,23 @@ def senza_margine(quote):
 
 
 def _leggi_csv(url):
+    """Ritorna (DataFrame, None) oppure (None, motivo). Gestisce il BOM UTF-8 che football-data.co.uk mette in fixtures.csv."""
     try:
         res = requests.get(url, timeout=20, headers=UA)
-        if res.status_code != 200:
-            return None
-        return pd.read_csv(io.BytesIO(res.content), encoding="latin-1", on_bad_lines="skip")
-    except Exception:
-        return None
+    except Exception as e:
+        return None, f"connessione fallita ({type(e).__name__})"
+    if res.status_code != 200:
+        return None, f"risposta HTTP {res.status_code}"
+    for enc in ("utf-8-sig", "latin-1"):
+        try:
+            d = pd.read_csv(io.BytesIO(res.content), encoding=enc, on_bad_lines="skip")
+            d.columns = [str(c).strip().lstrip("\ufeff") for c in d.columns]
+            return d, None
+        except UnicodeDecodeError:
+            continue
+        except Exception as e:
+            return None, f"file non leggibile ({type(e).__name__})"
+    return None, "codifica non riconosciuta"
 
 
 @st.cache_data(ttl=6 * 3600)
@@ -198,7 +208,7 @@ def carica_storico(div, n_stagioni, giorno):
     for k in range(n_stagioni):
         y = anno - k
         codice = f"{y % 100:02d}{(y + 1) % 100:02d}"
-        d = _leggi_csv(f"{BASE_URL}/mmz4281/{codice}/{div}.csv")
+        d, _ = _leggi_csv(f"{BASE_URL}/mmz4281/{codice}/{div}.csv")
         if d is None or not {"Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"}.issubset(d.columns):
             continue
         d["Stag"] = y
@@ -216,13 +226,16 @@ def carica_storico(div, n_stagioni, giorno):
 
 @st.cache_data(ttl=3600)
 def carica_fixtures(div):
-    d = _leggi_csv(f"{BASE_URL}/fixtures.csv")
-    if d is None or not {"Div", "HomeTeam", "AwayTeam"}.issubset(d.columns):
-        return None
+    """Ritorna (DataFrame, None) oppure (None, motivo)."""
+    d, err = _leggi_csv(f"{BASE_URL}/fixtures.csv")
+    if d is None:
+        return None, err
+    if not {"Div", "HomeTeam", "AwayTeam"}.issubset(d.columns):
+        return None, "colonne attese non trovate nel file"
     d = d[d["Div"] == div].dropna(subset=["HomeTeam", "AwayTeam"]).copy()
     if "Date" in d.columns:
         d["Date"] = pd.to_datetime(d["Date"], dayfirst=True, errors="coerce", format="mixed")
-    return d.reset_index(drop=True)
+    return d.reset_index(drop=True), None
 
 
 @st.cache_data(ttl=3600)
@@ -276,9 +289,12 @@ def costruisci_calendario(div, df_storico, fx, chiave, squadre_modello):
         righe.append({"Data": r["Date"].strftime("%Y-%m-%d"), "Ora": str(r["Time"])[:5] if "Time" in r and pd.notna(r.get("Time")) else "",
                       "Casa": r["HomeTeam"], "Trasferta": r["AwayTeam"], "GolC": int(r["FTHG"]), "GolT": int(r["FTAG"]),
                       "Stato": "FINISHED", "_d": r["Date"]})
+    giocate = {(r["Data"], r["Casa"], r["Trasferta"]) for r in righe}
     if fx is not None:
         for _, r in fx.iterrows():
             d = r["Date"] if "Date" in r and pd.notna(r["Date"]) else pd.Timestamp.max
+            if (d.strftime("%Y-%m-%d") if d != pd.Timestamp.max else "", r["HomeTeam"], r["AwayTeam"]) in giocate:
+                continue
             righe.append({"Data": d.strftime("%Y-%m-%d") if d != pd.Timestamp.max else "", "Ora": str(r["Time"])[:5] if "Time" in r and pd.notna(r.get("Time")) else "",
                           "Casa": r["HomeTeam"], "Trasferta": r["AwayTeam"], "GolC": None, "GolT": None, "Stato": "SCHEDULED", "_d": d})
     righe.sort(key=lambda r: r["_d"])
@@ -508,7 +524,8 @@ def backtest_cached(div, ridge, halflife, passo, giorno):
 _I, _J = np.meshgrid(np.arange(11), np.arange(11), indexing="ij")
 _MASK = {"p1": _I > _J, "px": _I == _J, "p2": _I < _J, "over1.5": (_I + _J) > 1.5, "over2.5": (_I + _J) > 2.5,
          "over3.5": (_I + _J) > 3.5, "btts": (_I > 0) & (_J > 0)}
-VARIANTI_MODELLO = ["Modello", "Senza Dixon-Coles", "Ancorato al mercato", "Misto 50/50"]
+VARIANTI_TIRI = ["Gol + Tiri 50/50", "Tiri in porta"]
+VARIANTI_MODELLO = ["Modello", "Senza Dixon-Coles", "Ancorato al mercato", "Misto 50/50"] + VARIANTI_TIRI
 VARIANTI = VARIANTI_MODELLO + ["Frequenze storiche"]
 
 
@@ -544,8 +561,9 @@ def esegui_test_completo(df, ridge, halflife, passo, solo_base=False):
     t = df.loc[df["Stag"] == stagioni[1], "Date"].min()
     fine = df["Date"].max()
     nan_m = np.full((11, 11), np.nan)
-    rec = {"Partita": [], "xs": [], "ys": [], "ok": [], "ou_ok": [], "m1x2": [], "mou": [], "min_storia": []}
+    rec = {"Partita": [], "xs": [], "ys": [], "ok": [], "ou_ok": [], "m1x2": [], "mou": [], "min_storia": [], "tiri_ok": []}
     Ms = {v: [] for v in VARIANTI}
+    ha_tiri = {"HST", "AST"}.issubset(df.columns)
     while t <= fine:
         blocco = df[(df["Date"] >= t) & (df["Date"] < t + pd.Timedelta(days=passo))]
         train = df[(df["Date"] < t) & (df["Date"] >= t - pd.Timedelta(days=FINESTRA_GIORNI))]
@@ -553,10 +571,27 @@ def esegui_test_completo(df, ridge, halflife, passo, solo_base=False):
             m = adatta_modello(train, t, ridge, halflife, True)
             cnt = pd.concat([train["HomeTeam"], train["AwayTeam"]]).value_counts()
             m_freq = matrice_frequenze(train)
+            m_t, conv = None, None
+            if ha_tiri and not solo_base:
+                tr_t = train.dropna(subset=["HST", "AST"])
+                if len(tr_t) >= 150 and tr_t["HST"].sum() > 0 and tr_t["AST"].sum() > 0:
+                    d_t = tr_t.copy()
+                    d_t["FTHG"], d_t["FTAG"] = tr_t["HST"].astype(int), tr_t["AST"].astype(int)
+                    scala = (tr_t["HST"] + tr_t["AST"]).mean() / max((tr_t["FTHG"] + tr_t["FTAG"]).mean(), 1e-9)
+                    m_t = adatta_modello(d_t, t, ridge * scala, halflife, False)  # shrinkage rapportata alla scala dei conteggi
+                    conv = (tr_t["FTHG"].sum() / tr_t["HST"].sum(), tr_t["FTAG"].sum() / tr_t["AST"].sum())  # gol per tiro in porta
             for _, r in blocco.iterrows():
                 h, a = r["HomeTeam"], r["AwayTeam"]
                 lh, la = lambda_partita(m, h, a)
                 Mb = matrice_punteggi(lh, la, m["rho"])
+                Mgt = Mt = nan_m
+                tiri_ok = False
+                if m_t is not None:
+                    lth, lta = lambda_partita(m_t, h, a)
+                    ls_h, ls_a = lth * conv[0], lta * conv[1]
+                    Mt = matrice_punteggi(ls_h, ls_a, m["rho"])
+                    Mgt = matrice_punteggi(math.sqrt(lh * ls_h), math.sqrt(la * ls_a), m["rho"])
+                    tiri_ok = True
                 if solo_base:
                     Mn = Ma = Mx = nan_m
                     qp = qc = qoc = None
@@ -578,7 +613,9 @@ def esegui_test_completo(df, ridge, halflife, passo, solo_base=False):
                 rec["m1x2"].append(senza_margine(qc) if qc else np.full(3, np.nan))
                 rec["mou"].append(float(senza_margine(qoc)[0]) if qoc else np.nan)
                 rec["min_storia"].append(int(min(cnt.get(h, 0), cnt.get(a, 0))))
-                for nome, Mv in zip(VARIANTI, (Mb, Mn, Ma, Mx, m_freq)):
+                rec["tiri_ok"].append(tiri_ok)
+                for nome, Mv in {"Modello": Mb, "Senza Dixon-Coles": Mn, "Ancorato al mercato": Ma, "Misto 50/50": Mx,
+                                 "Gol + Tiri 50/50": Mgt, "Tiri in porta": Mt, "Frequenze storiche": m_freq}.items():
                     Ms[nome].append(Mv)
         t += pd.Timedelta(days=passo)
     if not rec["xs"]:
@@ -642,7 +679,13 @@ def pesi_ottimi(res):
 
 
 def tabelle_test(res):
-    xs, ys, ok, ou_ok = res["xs"], res["ys"], res["ok"], res["ou_ok"]
+    # Le varianti con i tiri si confrontano solo se i tiri in porta sono disponibili per (quasi) tutte le partite
+    usa_tiri = bool(res["tiri_ok"].mean() >= 0.5)
+    VARIANTI_A = VARIANTI if usa_tiri else [v for v in VARIANTI if v not in VARIANTI_TIRI]
+    VARIANTI_MOD_A = [v for v in VARIANTI_MODELLO if v in VARIANTI_A]
+    xs, ys = res["xs"], res["ys"]
+    ok = res["ok"] & res["tiri_ok"] if usa_tiri else res["ok"]
+    ou_ok = res["ou_ok"] & res["tiri_ok"] if usa_tiri else res["ou_ok"]
     esito = np.where(xs > ys, 0, np.where(xs == ys, 1, 2))
     outc = {"over1.5": (xs + ys > 1.5).astype(float), "over2.5": (xs + ys > 2.5).astype(float),
             "over3.5": (xs + ys > 3.5).astype(float), "btts": ((xs > 0) & (ys > 0)).astype(float)}
@@ -660,9 +703,9 @@ def tabelle_test(res):
         xs_s, ys_s = xs[sel], ys[sel]
         outc_s = {k_: v[sel] for k_, v in outc.items()}
         es_s = esito[sel]
-        L = {v: _vettore_perdita(res["Ms"][v][sel], mk, xs_s, ys_s, outc_s, es_s) for v in VARIANTI}
+        L = {v: _vettore_perdita(res["Ms"][v][sel], mk, xs_s, ys_s, outc_s, es_s) for v in VARIANTI_A}
         r = {"Mercato": etichetta, "Partite": int(sel.sum())}
-        for v in VARIANTI:
+        for v in VARIANTI_A:
             r[v] = round(float(L[v].mean()), 4)
         Mb, Mf = res["Ms"]["Modello"][sel], res["Ms"]["Frequenze storiche"][sel]
         lw = {w: float(_vettore_perdita(w * Mb + (1 - w) * Mf, mk, xs_s, ys_s, outc_s, es_s).mean()) for w in W_GRID}
@@ -677,7 +720,7 @@ def tabelle_test(res):
             r["Mercato (chiusura)"] = None
         r["Modello − Frequenze (± err.)"] = _diff_se(L["Modello"], L["Frequenze storiche"])
         r["Ancorato − Modello (± err.)"] = _diff_se(L["Ancorato al mercato"], L["Modello"])
-        best = min(VARIANTI_MODELLO, key=lambda v: r[v])
+        best = min(VARIANTI_MOD_A, key=lambda v: r[v])
         r["Migliore"] = best
         migliore[mk] = best
         righe.append(r)
@@ -709,7 +752,7 @@ def tabelle_test(res):
 
     # Risultati esatti: presi e non presi
     righe_c = []
-    for v in VARIANTI:
+    for v in VARIANTI_A:
         Mv = res["Ms"][v][ok].reshape(ok.sum(), -1)
         ordine = np.argsort(-Mv, axis=1)[:, :3]
         reale = xs[ok] * 11 + ys[ok]
@@ -718,7 +761,7 @@ def tabelle_test(res):
                         "Nei primi 3 %": round((ordine == reale[:, None]).any(axis=1).mean() * 100, 1),
                         "Prob. media del 1° %": round(float(np.take_along_axis(Mv, ordine[:, :1], 1).mean() * 100), 1)})
     tab_c = pd.DataFrame(righe_c)
-    best_ex = min(VARIANTI_MODELLO, key=lambda v: float(tab_c.loc[tab_c["Variante"] == v, "Log score"].iloc[0]))
+    best_ex = min(VARIANTI_MOD_A, key=lambda v: float(tab_c.loc[tab_c["Variante"] == v, "Log score"].iloc[0]))
     idx = np.where(ok)[0][-25:]
     Mv = res["Ms"][best_ex]
     righe_d = []
@@ -827,7 +870,8 @@ if df_storico is None or len(df_storico) < 100:
     st.stop()
 par = parametri_auto(div, giorno)
 modello = modello_corrente(div, par["ridge"], par["halflife"], giorno)
-fx = carica_fixtures(div)
+fx, fx_err = carica_fixtures(div)
+oggi_ts = pd.Timestamp.now().normalize()
 calendario, fonte_cal = costruisci_calendario(div, df_storico, fx, chiave_api, modello["squadre"])
 
 # Quote del prossimo turno (1X2 + Over/Under 2.5 senza margine) e distribuzione dei punteggi "migliore disponibile"
@@ -864,6 +908,8 @@ def gol_attesi(M):
 righe_val = []
 if fx is not None:
     for _, r in fx.iterrows():
+        if "Date" in r and pd.notna(r["Date"]) and r["Date"] < oggi_ts:
+            continue  # partita già giocata
         q = prima_tripla(r, COL_PRESA)
         if not q:
             continue
@@ -935,6 +981,9 @@ def mostra_analisi(casa, trasf, data, ora):
             )
     st.markdown(f"<h3>🔬 Analisi Poisson / Dixon-Coles & Mercati: {casa} vs {trasf}</h3>", unsafe_allow_html=True)
     st.caption(f"Fonte Goal / Over-Under / Risultati esatti: {d['fonte']}.")
+    if not d["ancorata"]:
+        st.warning("⚠ Senza le quote del bookmaker, Goal/No Goal e Over/Under hanno poco potere predittivo: nel backtest su circa 1200 partite "
+                   "non hanno battuto in modo netto le semplici frequenze storiche. Considerali indicativi, vicini alla media del campionato.")
     a1, a2, a3 = st.columns(3)
     a1.metric("Segno 1 (Casa)", f"{mk['p1']*100:.1f}%", f"Quota equa: {1/mk['p1']:.2f}")
     a2.metric("Segno X (Pareggio)", f"{mk['px']*100:.1f}%", f"Quota equa: {1/mk['px']:.2f}")
@@ -1021,9 +1070,10 @@ with tab_classifica:
 with tab_value_finder:
     st.subheader("⚡ Scanner Value Finder")
     if fx is None:
-        st.warning("Impossibile scaricare il prossimo turno e le quote (fixtures.csv).")
+        st.warning(f"Impossibile scaricare il prossimo turno e le quote (fixtures.csv): {fx_err}.")
     elif df_value.empty:
-        st.info("Nessuna partita con quote nel prossimo turno (il file copre solo i prossimi giorni).")
+        st.info("Nessuna partita futura con quote: il file fixtures.csv viene aggiornato pochi giorni prima di ogni turno "
+                "e finché non c'è il turno successivo contiene solo partite già giocate.")
     else:
         st.caption("Edge = prob. modello × quota − 1, sulla media dei bookmaker. Qui si usa il modello puro: con le probabilità ancorate alle quote "
                    "l'edge sarebbe sempre negativo (il margine del bookmaker). Un edge alto di solito è un errore del modello: "
