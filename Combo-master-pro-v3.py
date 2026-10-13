@@ -1,4 +1,3 @@
-
 import difflib
 import io
 import math
@@ -109,6 +108,7 @@ API_CODICI = {"I1": "SA", "E0": "PL", "SP1": "PD", "D1": "BL1", "F1": "FL1", "N1
 BASE_URL = "https://football-data.co.uk"
 UA = {"User-Agent": "Mozilla/5.0"}
 N_STAGIONI = 3
+VERSIONE_TEST = 2  # cambia quando cambia la struttura dei risultati del test (invalida la cache)
 N_STAGIONI_TEST = 5  # il test usa più stagioni del modello per avere più partite su cui misurare
 W_GRID = (0.0, 0.25, 0.5, 0.75, 1.0)
 FINESTRA_GIORNI = 1000  # finestra di addestramento (circa 3 stagioni), come nell'app live
@@ -680,7 +680,7 @@ def pesi_ottimi(res):
 
 def tabelle_test(res):
     # Le varianti con i tiri si confrontano solo se i tiri in porta sono disponibili per (quasi) tutte le partite
-    usa_tiri = bool(res["tiri_ok"].mean() >= 0.5)
+    usa_tiri = res.get("tiri_ok") is not None and bool(res["tiri_ok"].mean() >= 0.5)
     VARIANTI_A = VARIANTI if usa_tiri else [v for v in VARIANTI if v not in VARIANTI_TIRI]
     VARIANTI_MOD_A = [v for v in VARIANTI_MODELLO if v in VARIANTI_A]
     xs, ys = res["xs"], res["ys"]
@@ -793,7 +793,7 @@ def tabelle_test(res):
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-def test_completo_cached(div, ridge, halflife, passo, giorno):
+def test_completo_cached(div, ridge, halflife, passo, giorno, versione):
     df = carica_storico(div, N_STAGIONI_TEST, giorno)
     return None if df is None else esegui_test_completo(df, ridge, halflife, passo)
 
@@ -1195,15 +1195,18 @@ with tab_backtest:
     st.markdown("---")
     st.markdown("### 🔬 Test completo: Goal/No Goal, Over/Under e Risultati Esatti")
     st.caption(f"Test su {N_STAGIONI_TEST} stagioni (la prima è storico iniziale), sempre walk-forward. Varianti: Modello, Senza Dixon-Coles, "
-               "Ancorato al mercato (gol attesi ricavati dalle quote 1X2 e Over/Under 2.5 prima della partita), Misto 50/50, Frequenze storiche e "
+               "Ancorato al mercato (gol attesi ricavati dalle quote 1X2 e Over/Under 2.5 prima della partita), Misto 50/50, "
+               "Tiri in porta (gol attesi stimati dai tiri in porta), Gol + Tiri 50/50, Frequenze storiche e "
                "Modello+Frequenze (con il peso migliore per ogni mercato). Valori più bassi = meglio.")
     st.caption(f"Pesi usati nell'app quando non ci sono quote (scelti dal backtest): modello {pesi['gol']*100:.0f}% per Goal/Over-Under, "
                f"{pesi['esatto']*100:.0f}% per i risultati esatti" + (f", su {pesi['n']} partite." if pesi.get("auto") else " (valori di riserva: dati insufficienti)."))
     if st.button("🧪 Esegui test completo"):
         with st.spinner("Calcolo in corso (può richiedere un minuto)..."):
-            st.session_state["tc"] = test_completo_cached(div, par["ridge"], par["halflife"], 14, giorno)
+            st.session_state["tc"] = test_completo_cached(div, par["ridge"], par["halflife"], 14, giorno, VERSIONE_TEST)
             st.session_state["tc_div"] = div
     tc = st.session_state.get("tc") if st.session_state.get("tc_div") == div else None
+    if tc is not None and "tiri_ok" not in tc:
+        tc = None  # risultato vecchio rimasto nella sessione: rilancia il test
     if tc is not None:
         tab_a, tab_b, tab_c, tab_d, tab_e, best_ex = tabelle_test(tc)
         st.markdown("#### 📏 Qualità per mercato (log loss, più basso è meglio)")
