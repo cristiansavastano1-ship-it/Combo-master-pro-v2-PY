@@ -108,7 +108,7 @@ API_CODICI = {"I1": "SA", "E0": "PL", "SP1": "PD", "D1": "BL1", "F1": "FL1", "N1
 BASE_URL = "https://football-data.co.uk"
 UA = {"User-Agent": "Mozilla/5.0"}
 N_STAGIONI = 3
-VERSIONE_TEST = 2  # cambia quando cambia la struttura dei risultati del test (invalida la cache)
+VERSIONE_TEST = 3  # cambia quando cambia la struttura dei risultati del test (invalida la cache)
 N_STAGIONI_TEST = 5  # il test usa più stagioni del modello per avere più partite su cui misurare
 W_GRID = (0.0, 0.25, 0.5, 0.75, 1.0)
 FINESTRA_GIORNI = 1000  # finestra di addestramento (circa 3 stagioni), come nell'app live
@@ -472,6 +472,22 @@ def tabella_scommesse(bt, soglie=(0, 2, 5, 8, 10)):
     return pd.DataFrame(righe)
 
 
+def riassunto_clv(bt, soglia_pct):
+    """CLV medio (e suo errore) delle scommesse simulate con edge >= soglia, dal backtest 1X2."""
+    ok = bt[["q1", "qx", "q2"]].notna().all(axis=1) & bt[["m1", "mx", "m2"]].notna().all(axis=1)
+    b = bt[ok]
+    if b.empty:
+        return 0, float("nan"), float("nan")
+    P, Q, M = b[["p1", "px", "p2"]].to_numpy(), b[["q1", "qx", "q2"]].to_numpy(), b[["m1", "mx", "m2"]].to_numpy()
+    edge = P * Q - 1
+    k = edge.argmax(axis=1)
+    sel = edge[np.arange(len(b)), k] >= soglia_pct / 100
+    if sel.sum() < 2:
+        return int(sel.sum()), float("nan"), float("nan")
+    clv = (Q[np.arange(len(b)), k] * M[np.arange(len(b)), k] - 1)[sel]
+    return int(sel.sum()), float(clv.mean() * 100), float(clv.std(ddof=1) / math.sqrt(len(clv)) * 100)
+
+
 def tabella_calibrazione(bt, bins=10):
     P = bt[["p1", "px", "p2"]].to_numpy().ravel()
     O = np.eye(3)[bt["y"].to_numpy(int)].ravel()
@@ -485,10 +501,9 @@ def tabella_calibrazione(bt, bins=10):
     return pd.DataFrame(righe)
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner="Ottimizzo i parametri del modello (solo la prima volta di giornata)...")
-def parametri_auto(div, giorno):
-    """Sceglie da solo shrinkage ed emivita: griglia piccola, valutata con il backtest walk-forward (log loss)."""
-    df = carica_storico(div, N_STAGIONI, giorno)
+def scegli_parametri(df):
+    """Sceglie shrinkage ed emivita con una griglia piccola, valutata col backtest walk-forward (log loss 1X2)
+    usando SOLO i dati passati in df."""
     default = {"ridge": 2.0, "halflife": 365, "log_loss": None, "ricerca": [], "auto": False}
     if df is None or df["Stag"].nunique() < 2:
         return default
@@ -504,6 +519,11 @@ def parametri_auto(div, giorno):
     best = min(ricerca, key=lambda z: z["Log loss"])
     return {"ridge": best["_r"], "halflife": best["_h"], "log_loss": best["Log loss"], "auto": True,
             "ricerca": [{k: v for k, v in z.items() if not k.startswith("_")} for z in ricerca]}
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner="Ottimizzo i parametri del modello (solo la prima volta di giornata)...")
+def parametri_auto(div, giorno):
+    return scegli_parametri(carica_storico(div, N_STAGIONI, giorno))
 
 
 @st.cache_data(ttl=6 * 3600)
@@ -552,16 +572,16 @@ def matrice_ancorata(p1x2, p_over25, rho, start):
     return matrice_punteggi(math.exp(res.x[0]), math.exp(res.x[1]), rho)
 
 
-def esegui_test_completo(df, ridge, halflife, passo, solo_base=False):
+def esegui_test_completo(df, ridge, halflife, passo, solo_base=False, inizio=None):
     """Walk-forward come il backtest, ma conserva l'intera distribuzione dei punteggi di ogni variante.
     Con solo_base=True calcola solo Modello e Frequenze storiche (più veloce: serve a scegliere i pesi)."""
     stagioni = sorted(df["Stag"].unique())
     if len(stagioni) < 2:
         return None
-    t = df.loc[df["Stag"] == stagioni[1], "Date"].min()
+    t = inizio if inizio is not None else df.loc[df["Stag"] == stagioni[1], "Date"].min()
     fine = df["Date"].max()
     nan_m = np.full((11, 11), np.nan)
-    rec = {"Partita": [], "xs": [], "ys": [], "ok": [], "ou_ok": [], "m1x2": [], "mou": [], "min_storia": [], "tiri_ok": []}
+    rec = {"Partita": [], "xs": [], "ys": [], "ok": [], "ou_ok": [], "m1x2": [], "mou": [], "min_storia": [], "tiri_ok": [], "date": []}
     Ms = {v: [] for v in VARIANTI}
     ha_tiri = {"HST", "AST"}.issubset(df.columns)
     while t <= fine:
@@ -594,7 +614,8 @@ def esegui_test_completo(df, ridge, halflife, passo, solo_base=False):
                     tiri_ok = True
                 if solo_base:
                     Mn = Ma = Mx = nan_m
-                    qp = qc = qoc = None
+                    qp = None
+                    qc, qoc = prima_tripla(r, COL_CHIUSURA), prima_coppia(r, COL_OU_CHIUSURA)
                 else:
                     Mn = matrice_punteggi(lh, la, 0.0)
                     qp, qo = prima_tripla(r, COL_PRESA), prima_coppia(r, COL_OU_PRESA)
@@ -606,6 +627,7 @@ def esegui_test_completo(df, ridge, halflife, passo, solo_base=False):
                         Ma = Mx = nan_m
                     qc, qoc = prima_tripla(r, COL_CHIUSURA), prima_coppia(r, COL_OU_CHIUSURA)
                 rec["Partita"].append(f"{h} - {a}")
+                rec["date"].append(r["Date"])
                 rec["xs"].append(min(int(r["FTHG"]), 10))
                 rec["ys"].append(min(int(r["FTAG"]), 10))
                 rec["ok"].append(bool(qp))
@@ -720,6 +742,11 @@ def tabelle_test(res):
             r["Mercato (chiusura)"] = None
         r["Modello − Frequenze (± err.)"] = _diff_se(L["Modello"], L["Frequenze storiche"])
         r["Ancorato − Modello (± err.)"] = _diff_se(L["Ancorato al mercato"], L["Modello"])
+        L_mix = _vettore_perdita(w_best * Mb + (1 - w_best) * Mf, mk, xs_s, ys_s, outc_s, es_s)
+        r["Modello+Freq − Frequenze (± err.)"] = _diff_se(L_mix, L["Frequenze storiche"])
+        if usa_tiri:
+            r["Gol+Tiri − Modello (± err.)"] = _diff_se(L["Gol + Tiri 50/50"], L["Modello"])
+            r["Tiri − Modello (± err.)"] = _diff_se(L["Tiri in porta"], L["Modello"])
         best = min(VARIANTI_MOD_A, key=lambda v: r[v])
         r["Migliore"] = best
         migliore[mk] = best
@@ -808,6 +835,93 @@ def pesi_blend_auto(div, ridge, halflife, giorno):
     w = pesi_ottimi(res)
     w["auto"] = True
     return w
+
+
+# ======================= TEST SU STAGIONI MAI VISTE =======================
+MERCATI_GOL = [("Over/Under 1.5", "over1.5"), ("Over/Under 2.5", "over2.5"), ("Over/Under 3.5", "over3.5"),
+               ("Goal / No Goal", "btts"), ("Risultato esatto (log score)", "exact")]
+
+
+def _esiti(xs, ys):
+    esito = np.where(xs > ys, 0, np.where(xs == ys, 1, 2))
+    outc = {"over1.5": (xs + ys > 1.5).astype(float), "over2.5": (xs + ys > 2.5).astype(float),
+            "over3.5": (xs + ys > 3.5).astype(float), "btts": ((xs > 0) & (ys > 0)).astype(float)}
+    return esito, outc
+
+
+def test_stagioni_nuove(df, ridge_att, halflife_att, passo=14):
+    """Per ogni stagione (dalla terza in poi) parametri e pesi sono scelti usando SOLO le stagioni precedenti;
+    poi si misura la qualità sulla stagione stessa, mai vista in fase di scelta."""
+    stagioni = sorted(df["Stag"].unique())
+    righe, tutte = [], {"new": [], "att": [], "mkt": [], "freq": []}
+    perd = {mk: {"Modello": [], "Frequenze": [], "Misto": []} for _, mk in MERCATI_GOL}
+    pesi_usati = {"gol": [], "esatto": []}
+    for k in stagioni[2:]:
+        t0 = df.loc[df["Stag"] == k, "Date"].min()
+        prima = df[df["Date"] < t0]
+        pk = scegli_parametri(prima)
+        res_prev = esegui_test_completo(prima, pk["ridge"], pk["halflife"], 28, solo_base=True)
+        if res_prev is None or len(res_prev["xs"]) < 100:
+            continue
+        w = pesi_ottimi(res_prev)
+        dk = df[df["Stag"] <= k]
+        rn = esegui_test_completo(dk, pk["ridge"], pk["halflife"], passo, solo_base=True, inizio=t0)
+        ra = esegui_test_completo(dk, ridge_att, halflife_att, passo, solo_base=True, inizio=t0)
+        if rn is None or len(rn["xs"]) < 20:
+            continue
+        xs, ys = rn["xs"], rn["ys"]
+        esito, outc = _esiti(xs, ys)
+        n = len(xs)
+        Ln = _vettore_perdita(rn["Ms"]["Modello"], "1x2", xs, ys, outc, esito)
+        Lf = _vettore_perdita(rn["Ms"]["Frequenze storiche"], "1x2", xs, ys, outc, esito)
+        La = _vettore_perdita(ra["Ms"]["Modello"], "1x2", xs, ys, outc, esito) if ra is not None and ra["Partita"] == rn["Partita"] else np.full(n, np.nan)
+        ok_m = ~np.isnan(rn["m1x2"]).any(axis=1)
+        Lm = np.full(n, np.nan)
+        Lm[ok_m] = -np.log(np.clip(rn["m1x2"][ok_m][np.arange(ok_m.sum()), esito[ok_m]], 1e-9, 1))
+        tutte["new"].append(Ln); tutte["att"].append(La); tutte["mkt"].append(Lm); tutte["freq"].append(Lf)
+        etichetta = f"{int(k)}/{(int(k) + 1) % 100:02d}" + (" (parziale)" if k == stagioni[-1] else "")
+        riga = {"Stagione": etichetta, "Parametri scelti (λ / emivita)": f"{pk['ridge']} / {pk['halflife'] if pk['halflife'] else 'nessuna'}",
+                "Partite": n, "Modello (parametri scelti prima)": round(float(Ln.mean()), 4),
+                "Modello (parametri attuali)": round(float(np.nanmean(La)), 4) if np.isfinite(La).any() else None,
+                "Frequenze storiche": round(float(Lf.mean()), 4),
+                "Mercato (chiusura)": round(float(np.nanmean(Lm)), 4) if ok_m.any() else None}
+        riga["Modello − Mercato (± err.)"] = _diff_se(Ln[ok_m], Lm[ok_m]) if ok_m.sum() > 5 else None
+        riga["Scelti prima − Attuali (± err.)"] = _diff_se(Ln, La) if np.isfinite(La).all() else None
+        righe.append(riga)
+        # mercati gol/esatti: peso scelto sulle stagioni precedenti
+        Mb, Mf = rn["Ms"]["Modello"], rn["Ms"]["Frequenze storiche"]
+        for _, mk in MERCATI_GOL:
+            wk = w["esatto"] if mk == "exact" else w["gol"]
+            perd[mk]["Modello"].append(_vettore_perdita(Mb, mk, xs, ys, outc, esito))
+            perd[mk]["Frequenze"].append(_vettore_perdita(Mf, mk, xs, ys, outc, esito))
+            perd[mk]["Misto"].append(_vettore_perdita(wk * Mb + (1 - wk) * Mf, mk, xs, ys, outc, esito))
+        pesi_usati["gol"].append(f"{etichetta.split(' ')[0]}: {int(w['gol'] * 100)}")
+        pesi_usati["esatto"].append(f"{etichetta.split(' ')[0]}: {int(w['esatto'] * 100)}")
+    if not righe:
+        return None, None
+    Ln, La, Lm, Lf = (np.concatenate(tutte[k_]) for k_ in ("new", "att", "mkt", "freq"))
+    ok_m = np.isfinite(Lm)
+    riga = {"Stagione": "TUTTE", "Parametri scelti (λ / emivita)": "", "Partite": len(Ln),
+            "Modello (parametri scelti prima)": round(float(Ln.mean()), 4),
+            "Modello (parametri attuali)": round(float(np.nanmean(La)), 4) if np.isfinite(La).any() else None,
+            "Frequenze storiche": round(float(Lf.mean()), 4), "Mercato (chiusura)": round(float(Lm[ok_m].mean()), 4) if ok_m.any() else None,
+            "Modello − Mercato (± err.)": _diff_se(Ln[ok_m], Lm[ok_m]) if ok_m.sum() > 5 else None,
+            "Scelti prima − Attuali (± err.)": _diff_se(Ln, La) if np.isfinite(La).all() else None}
+    tab1 = pd.DataFrame(righe + [riga])
+    righe2 = []
+    for etichetta, mk in MERCATI_GOL:
+        M_, F_, X_ = (np.concatenate(perd[mk][v]) for v in ("Modello", "Frequenze", "Misto"))
+        pesi_txt = " · ".join(pesi_usati["esatto" if mk == "exact" else "gol"])
+        righe2.append({"Mercato": etichetta, "Partite": len(M_), "Modello": round(float(M_.mean()), 4), "Frequenze storiche": round(float(F_.mean()), 4),
+                       "Misto (pesi scelti prima)": round(float(X_.mean()), 4), "Peso modello % per stagione": pesi_txt,
+                       "Misto − Frequenze (± err.)": _diff_se(X_, F_), "Misto − Modello (± err.)": _diff_se(X_, M_)})
+    return tab1, pd.DataFrame(righe2)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def stagioni_nuove_cached(div, ridge, halflife, passo, giorno, versione):
+    df = carica_storico(div, N_STAGIONI_TEST, giorno)
+    return (None, None) if df is None else test_stagioni_nuove(df, ridge, halflife, passo)
 
 
 # ======================= STATISTICHE, CLASSIFICA =======================
@@ -1079,6 +1193,20 @@ with tab_value_finder:
                    "l'edge sarebbe sempre negativo (il margine del bookmaker). Un edge alto di solito è un errore del modello: "
                    "controlla nel tab Backtest da quale soglia l'edge ha avuto CLV positivo.")
         min_edge = st.slider("Edge Minimo (%)", 0.0, 25.0, 3.0)
+        bt_b = backtest_cached(div, par["ridge"], par["halflife"], 14, giorno)
+        if bt_b is not None and not bt_b.empty:
+            n_b, clv_m, clv_se = riassunto_clv(bt_b, min_edge)
+            if n_b < 30 or not np.isfinite(clv_m):
+                st.info(f"Backtest: solo {n_b} scommesse simulate con edge ≥ {min_edge:.0f}%, troppo poche per giudicare.")
+            elif clv_m + 2 * clv_se < 0:
+                st.warning(f"⚠ Edge NON dimostrato. Nel backtest, le {n_b} scommesse simulate con edge ≥ {min_edge:.0f}% hanno avuto CLV medio "
+                           f"{clv_m:+.1f}% (± {clv_se:.1f}): in passato questo segnale ha preso quote peggiori del mercato di chiusura.")
+            elif clv_m - 2 * clv_se > 0:
+                st.success(f"Nel backtest le {n_b} scommesse con edge ≥ {min_edge:.0f}% hanno avuto CLV medio {clv_m:+.1f}% (± {clv_se:.1f}). "
+                           "È un buon segnale, ma va confermato su partite nuove.")
+            else:
+                st.info(f"Backtest: CLV medio {clv_m:+.1f}% (± {clv_se:.1f}) su {n_b} scommesse con edge ≥ {min_edge:.0f}%: "
+                        "non distinguibile da zero, quindi nessun vantaggio dimostrato.")
         st.dataframe(df_value[df_value["Edge"] >= min_edge], use_container_width=True, hide_index=True)
         if (df_value["Nota"] != "").any():
             st.caption("⚠ Squadre senza storico (es. neopromosse) sono trattate come squadra media: probabilmente sopravvalutate.")
@@ -1225,6 +1353,27 @@ with tab_backtest:
             st.markdown("#### 🆕 Squadre con poca storia (neopromosse)")
             st.dataframe(tab_e, use_container_width=True, hide_index=True)
             st.caption("Stesse partite, tre fonti: se anche il mercato sbaglia di più su queste squadre, non è un difetto solo del modello.")
+
+    st.markdown("---")
+    st.markdown("### 🧊 Test su stagioni mai viste")
+    st.caption("Per ogni stagione (dalla terza in poi) i parametri del modello e i pesi tra modello e frequenze vengono scelti usando SOLO le stagioni precedenti; "
+               "poi si misura su quella stagione, che non ha influito sulla scelta. È la verifica più onesta: se i numeri qui restano buoni, "
+               "la scelta automatica non ti sta ingannando.")
+    if st.button("🧊 Esegui test su stagioni nuove"):
+        with st.spinner("Calcolo in corso (può richiedere alcuni minuti la prima volta)..."):
+            st.session_state["sn"] = stagioni_nuove_cached(div, par["ridge"], par["halflife"], 14, giorno, VERSIONE_TEST)
+            st.session_state["sn_div"] = div
+    sn = st.session_state.get("sn") if st.session_state.get("sn_div") == div else None
+    if sn is not None and sn[0] is not None:
+        st.markdown("#### 📏 1X2: parametri scelti prima contro parametri attuali")
+        st.dataframe(sn[0], use_container_width=True, hide_index=True)
+        st.caption("Log loss, più basso è meglio. Se 'Scelti prima' è vicino a 'Attuali' (differenza più piccola di circa 2 volte l'errore), "
+                   "la scelta automatica dei parametri non sta sovra-adattando. L'ultima stagione è quella in corso, con poche partite.")
+        st.markdown("#### 🎯 Goal/No Goal, Over/Under e risultati esatti con pesi scelti sul passato")
+        st.dataframe(sn[1], use_container_width=True, hide_index=True)
+        st.caption("Se 'Misto − Frequenze' è negativo e più grande di circa 2 volte l'errore, il misto batte davvero le frequenze fuori campione.")
+    elif sn is not None:
+        st.warning("Dati insufficienti per questo test: servono almeno 3 stagioni.")
 
 # --- VALUE BET (KELLY) ---
 with tab_kelly:
