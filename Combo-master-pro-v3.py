@@ -721,7 +721,7 @@ def tabelle_test(res):
             "over3.5": (xs + ys > 3.5).astype(float), "btts": ((xs > 0) & (ys > 0)).astype(float)}
     mercati_def = [("1X2", "1x2"), ("Over/Under 1.5", "over1.5"), ("Over/Under 2.5", "over2.5"),
                    ("Over/Under 3.5", "over3.5"), ("Goal / No Goal", "btts"), ("Risultato esatto (log score)", "exact")]
-    righe, migliore = [], {}
+    righe, migliore, peso_mk = [], {}, {}
     for etichetta, mk in mercati_def:
         sel = ok.copy()
         if mk == "over2.5":
@@ -758,6 +758,7 @@ def tabelle_test(res):
         best = min(VARIANTI_MOD_A, key=lambda v: r[v])
         r["Migliore"] = best
         migliore[mk] = best
+        peso_mk[mk] = w_best
         righe.append(r)
     tab_a = pd.DataFrame(righe)
 
@@ -824,7 +825,29 @@ def tabelle_test(res):
                 riga[f"Log loss 1X2 ({v})"] = round(float(_vettore_perdita(res["Ms"][v][sel_e], "1x2", xs[sel_e], ys[sel_e], {}, es_e).mean()), 4)
             riga["Log loss 1X2 (Mercato chiusura)"] = round(float(-np.mean(np.log(np.clip(res["m1x2"][sel_e][np.arange(sel_e.sum()), es_e], 1e-9, 1)))), 4)
             righe_e.append(riga)
-    return tab_a, tab_b, tab_c, tab_d, pd.DataFrame(righe_e), best_ex
+    # Calibrazione di Goal e Over 2.5: previsto vs reale per fascia, per le tre fonti usate dall'app
+    righe_cal = []
+    for nome_m, mk in (("Goal", "btts"), ("Over 2.5", "over2.5")):
+        sel_c = ou_ok if mk == "over2.5" else ok
+        if sel_c.sum() < 30 or mk not in peso_mk:
+            continue
+        Mb_c, Mf_c = res["Ms"]["Modello"][sel_c], res["Ms"]["Frequenze storiche"][sel_c]
+        w_c = peso_mk[mk]
+        fonti = {"Modello da solo": Mb_c, f"Modello+Frequenze (peso modello {int(w_c * 100)}%)": w_c * Mb_c + (1 - w_c) * Mf_c,
+                 "Ancorato al mercato": res["Ms"]["Ancorato al mercato"][sel_c]}
+        o_c = outc[mk][sel_c]
+        for nome_f, Mv in fonti.items():
+            pm = _p_mercato(Mv, mk)
+            righe_cal.append({"Mercato": nome_m, "Fonte": nome_f, "Fascia": "TUTTE", "Partite": len(pm),
+                              "Prevista %": round(float(pm.mean() * 100), 1), "Reale %": round(float(o_c.mean() * 100), 1),
+                              "Differenza (punti)": round(float((pm.mean() - o_c.mean()) * 100), 1)})
+            for lo, hi in [(0, 0.40), (0.40, 0.50), (0.50, 0.60), (0.60, 1.01)]:
+                m_ = (pm >= lo) & (pm < hi)
+                if m_.sum() >= 15:
+                    righe_cal.append({"Mercato": nome_m, "Fonte": nome_f, "Fascia": f"{int(lo * 100)}-{min(int(hi * 100), 100)}%", "Partite": int(m_.sum()),
+                                      "Prevista %": round(float(pm[m_].mean() * 100), 1), "Reale %": round(float(o_c[m_].mean() * 100), 1),
+                                      "Differenza (punti)": round(float((pm[m_].mean() - o_c[m_].mean()) * 100), 1)})
+    return tab_a, tab_b, tab_c, tab_d, pd.DataFrame(righe_e), best_ex, pd.DataFrame(righe_cal)
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
@@ -1151,27 +1174,45 @@ def matrice_congiunta(M_1x2, M_gol):
     return out / out.sum()
 
 
-def _riga_prob(etichetta, p):
-    return {"Mercato": etichetta, "Probabilità %": round(float(p) * 100, 1), "Quota equa": round(1 / p, 2) if p > 1e-6 else None}
+def _riga_prob(etichetta, p, freq=None):
+    r = {"Mercato": etichetta, "Probabilità %": round(float(p) * 100, 1), "Quota equa": round(1 / p, 2) if p > 1e-6 else None}
+    if freq is not None and etichetta in freq:
+        r["Media storica %"] = round(freq[etichetta] * 100, 1)
+        r["Differenza (punti)"] = round(float(p) * 100 - freq[etichetta] * 100, 1)
+    return r
 
 
-def tabelle_pronostico(M_1x2, M_gol):
+def frequenze_combo(df):
+    """Frequenza reale (ultime stagioni del campionato) di esiti, combo e multigol: serve da confronto con le probabilità del modello."""
+    gh, ga = df["FTHG"].to_numpy(), df["FTAG"].to_numpy()
+    esiti = {"1": gh > ga, "X": gh == ga, "2": gh < ga}
+    esiti["1X"], esiti["X2"], esiti["12"] = esiti["1"] | esiti["X"], esiti["X"] | esiti["2"], esiti["1"] | esiti["2"]
+    gol, ov = (gh > 0) & (ga > 0), (gh + ga) > 2.5
+    merc = {"Goal": gol, "No Goal": ~gol, "Over 2.5": ov, "Under 2.5": ~ov}
+    out = {e: float(m.mean()) for e, m in esiti.items()}
+    out.update({f"{e} + {m}": float((esiti[e] & merc[m]).mean()) for e in esiti for m in merc})
+    tot = gh + ga
+    out.update({f"{a}-{b} gol": float(((tot >= a) & (tot <= b)).mean()) for a, b in [(1, 2), (1, 3), (1, 4), (1, 5), (2, 3), (2, 4), (2, 5), (3, 5), (3, 6)]})
+    return out
+
+
+def tabelle_pronostico(M_1x2, M_gol, freq=None):
     Mj = matrice_congiunta(M_1x2, M_gol)
     p = {k: float(M_1x2[m].sum()) for k, m in _ESITI_MASK.items()}
     out = {"p": p}
     best = max(("1", "X", "2"), key=lambda k: p[k])
     out["pronostico"] = best
-    out["doppie"] = pd.DataFrame([_riga_prob(k, p[k]) for k in ("1X", "X2", "12")]).sort_values("Probabilità %", ascending=False)
+    out["doppie"] = pd.DataFrame([_riga_prob(k, p[k], freq) for k in ("1X", "X2", "12")]).sort_values("Probabilità %", ascending=False)
     out["doppia_best"] = max(("1X", "X2", "12"), key=lambda k: p[k])
 
     def combo(esiti, mercati):
         righe = [(f"{e} + {m}", float(Mj[_ESITI_MASK[e] & _MERC_MASK[m]].sum())) for e in esiti for m in mercati]
-        return pd.DataFrame([_riga_prob(l, v) for l, v in sorted(righe, key=lambda r: -r[1])])
+        return pd.DataFrame([_riga_prob(l, v, freq) for l, v in sorted(righe, key=lambda r: -r[1])])
     out["combo_goal"] = combo(("1", "X", "2"), ("Goal", "No Goal"))
     out["combo_ou"] = combo(("1", "X", "2"), ("Over 2.5", "Under 2.5"))
     out["combo_doppie"] = combo(("1X", "X2", "12"), ("Goal", "No Goal", "Over 2.5", "Under 2.5"))
     # Multigol (totale e per squadra) dalla distribuzione dei gol
-    out["multigol_tot"] = pd.DataFrame([_riga_prob(f"{a}-{b} gol", M_gol[(_TOT >= a) & (_TOT <= b)].sum())
+    out["multigol_tot"] = pd.DataFrame([_riga_prob(f"{a}-{b} gol", M_gol[(_TOT >= a) & (_TOT <= b)].sum(), freq)
                                         for a, b in [(1, 2), (1, 3), (1, 4), (1, 5), (2, 3), (2, 4), (2, 5), (3, 5), (3, 6)]])
     larghi3 = {f"{a}-{b}": float(M_gol[(_TOT >= a) & (_TOT <= b)].sum()) for a, b in [(1, 3), (2, 4), (3, 5)]}
     out["multigol_best"] = max(larghi3, key=larghi3.get)
@@ -1228,6 +1269,7 @@ calendario, fonte_cal = costruisci_calendario(div, df_storico, fx, chiave_api, m
 # Quote del prossimo turno (1X2 + Over/Under 2.5 senza margine) e distribuzione dei punteggi "migliore disponibile"
 pesi = pesi_blend_auto(div, par["ridge"], par["halflife"], giorno)
 M_freq_live = matrice_frequenze(df_storico)
+freq_combo = frequenze_combo(df_storico)
 quote_fixtures = {}
 if fx is not None:
     for _, _r in fx.iterrows():
@@ -1335,7 +1377,7 @@ def mostra_analisi(casa, trasf, data, ora):
     if not d["ancorata"]:
         st.warning("⚠ Senza le quote del bookmaker, Goal/No Goal e Over/Under hanno poco potere predittivo: nel backtest su circa 1200 partite "
                    "non hanno battuto in modo netto le semplici frequenze storiche. Considerali indicativi, vicini alla media del campionato.")
-    pr = tabelle_pronostico(d["M_1x2"], d["M_gol"])
+    pr = tabelle_pronostico(d["M_1x2"], d["M_gol"], freq_combo)
     pp = pr["p"]
     st.markdown("#### 🎯 Il pronostico")
     r1, r2, r3, r4 = st.columns(4)
@@ -1344,10 +1386,18 @@ def mostra_analisi(casa, trasf, data, ora):
     cg = pr["combo_goal"].iloc[0]
     r3.metric("Combo più probabile (1X2 + Goal)", cg["Mercato"], f"{cg['Probabilità %']:.1f}%", delta_color="off")
     r4.metric("Multigol più probabile (3 gol)", pr["multigol_best"] + " gol", f"{pr['multigol_best_p']*100:.1f}%", delta_color="off")
+    s1, s2, s3 = st.columns(3)
+    cs = pr["combo_goal"].sort_values("Differenza (punti)", ascending=False).iloc[0]
+    s1.metric("Più sopra la media (1X2 + Goal)", cs["Mercato"], f"{cs['Differenza (punti)']:+.1f} punti rispetto alla media storica", delta_color="off")
+    co1 = pr["combo_ou"].iloc[0]
+    s2.metric("Combo più probabile (1X2 + Over/Under 2.5)", co1["Mercato"], f"{co1['Probabilità %']:.1f}%", delta_color="off")
+    cs2 = pr["combo_ou"].sort_values("Differenza (punti)", ascending=False).iloc[0]
+    s3.metric("Più sopra la media (1X2 + Over/Under 2.5)", cs2["Mercato"], f"{cs2['Differenza (punti)']:+.1f} punti rispetto alla media storica", delta_color="off")
     gap = abs(pp["1"] - pp["2"]) * 100
-    st.caption(f"La X vale {pp['X']*100:.1f}% e la differenza tra 1 e 2 è di {gap:.1f} punti. La X è quasi mai l'esito singolo più probabile (succede solo "
-               "nelle partite molto equilibrate, anche con le quote del mercato): per questo nelle partite equilibrate conviene guardare la doppia chance. "
-               "Nel Backtest, sezione 'Il pareggio', trovi se il modello sottostima i pareggi.")
+    st.caption(f"La X vale {pp['X']*100:.1f}% (media storica del campionato: {freq_combo['X']*100:.1f}%) e la differenza tra 1 e 2 è di {gap:.1f} punti. "
+               "La X è quasi mai l'esito singolo più probabile, anche con le quote del mercato: nelle partite equilibrate guarda la doppia chance. "
+               "'Più sopra la media' mostra dove il modello vede qualcosa di diverso dal solito, mentre 'più probabile' dice soprattutto chi è la favorita. "
+               "Nel Backtest, sezioni 'Il pareggio' e 'Calibrazione Goal', trovi se il modello sbaglia sistematicamente.")
     a1, a2, a3 = st.columns(3)
     a1.metric("Segno 1 (Casa)", f"{mk['p1']*100:.1f}%", f"Quota equa: {1/mk['p1']:.2f}")
     a2.metric("Segno X (Pareggio)", f"{mk['px']*100:.1f}%", f"Quota equa: {1/mk['px']:.2f}")
@@ -1613,12 +1663,17 @@ with tab_backtest:
     if tc is not None and "tiri_ok" not in tc:
         tc = None  # risultato vecchio rimasto nella sessione: rilancia il test
     if tc is not None:
-        tab_a, tab_b, tab_c, tab_d, tab_e, best_ex = tabelle_test(tc)
+        tab_a, tab_b, tab_c, tab_d, tab_e, best_ex, tab_cal = tabelle_test(tc)
         st.markdown("#### 📏 Qualità per mercato (log loss, più basso è meglio)")
         st.dataframe(tab_a, use_container_width=True, hide_index=True)
         st.caption("Per Risultato esatto il valore è il log score del punteggio reale. 'Mercato (chiusura)' è il riferimento delle quote senza margine, "
                    "disponibile solo per 1X2 e Over/Under 2.5. Le colonne con ± mostrano la differenza media per partita e il suo errore: "
                    "se la differenza è più piccola di circa 2 volte l'errore, non è distinguibile dal caso.")
+        st.markdown("#### ⚖️ Calibrazione Goal e Over 2.5: il modello li sottostima o li sovrastima?")
+        if not tab_cal.empty:
+            st.dataframe(tab_cal, use_container_width=True, hide_index=True)
+            st.caption("Differenza = prevista − reale, in punti percentuali. Se per il Goal è NEGATIVA (prevista più bassa della reale), il modello sottostima il Goal "
+                       "e sovrastima il No Goal. Le righe 'TUTTE' dicono se c'è uno sbilanciamento medio; le fasce dicono dove.")
         st.markdown("#### ✅ Presi e non presi: quando il modello è sicuro, quante volte ha ragione")
         st.dataframe(tab_b, use_container_width=True, hide_index=True)
         st.caption("Se 'Presi %' è molto sotto 'Prob. dichiarata %', il modello è troppo ottimista a quella soglia.")
