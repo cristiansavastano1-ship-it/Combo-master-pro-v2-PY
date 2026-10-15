@@ -303,7 +303,7 @@ def costruisci_calendario(div, df_storico, fx, chiave, squadre_modello):
 
 
 # ======================= MODELLO =======================
-def adatta_modello(df, data_rif, ridge, halflife, usa_dc=True):
+def adatta_modello(df, data_rif, ridge, halflife, usa_dc=True, elo_diff=None):
     """Poisson con forza d'attacco e di difesa per squadra, vantaggio casa, shrinkage (ridge) verso la media,
     pesi che decadono col tempo e correzione Dixon-Coles sui punteggi bassi."""
     squadre = sorted(set(df["HomeTeam"]) | set(df["AwayTeam"]))
@@ -316,11 +316,15 @@ def adatta_modello(df, data_rif, ridge, halflife, usa_dc=True):
     eta_gg = (data_rif - df["Date"]).dt.days.clip(lower=0).to_numpy(float)
     w = np.exp(-np.log(2) * eta_gg / halflife) if halflife and halflife > 0 else np.ones(len(df))
 
+    use_elo = elo_diff is not None
+    de = np.asarray(elo_diff, float) if use_elo else np.zeros(len(df))
+
     def f(th):
         mu, hm = th[0], th[1]
-        att, dfn = th[2:2 + n], th[2 + n:]
-        eh = mu + hm + att[hi] + dfn[ai]
-        ea = mu + att[ai] + dfn[hi]
+        att, dfn = th[2:2 + n], th[2 + n:2 + 2 * n]
+        beta = th[2 + 2 * n] if use_elo else 0.0
+        eh = mu + hm + att[hi] + dfn[ai] + beta * de
+        ea = mu + att[ai] + dfn[hi] - beta * de
         lh, la = np.exp(eh), np.exp(ea)
         nll = -np.sum(w * (x * eh - lh + y * ea - la)) + ridge * (att @ att + dfn @ dfn)
         rh, ra = w * (x - lh), w * (y - la)
@@ -328,18 +332,21 @@ def adatta_modello(df, data_rif, ridge, halflife, usa_dc=True):
         g[0] = -(rh.sum() + ra.sum())
         g[1] = -rh.sum()
         g[2:2 + n] = -(np.bincount(hi, rh, n) + np.bincount(ai, ra, n)) + 2 * ridge * att
-        g[2 + n:] = -(np.bincount(ai, rh, n) + np.bincount(hi, ra, n)) + 2 * ridge * dfn
+        g[2 + n:2 + 2 * n] = -(np.bincount(ai, rh, n) + np.bincount(hi, ra, n)) + 2 * ridge * dfn
+        if use_elo:
+            g[2 + 2 * n] = -np.sum(de * (rh - ra))  # beta non è penalizzato
         return nll, g
 
-    th0 = np.zeros(2 + 2 * n)
+    th0 = np.zeros(2 + 2 * n + (1 if use_elo else 0))
     th0[0] = np.log(max((x.mean() + y.mean()) / 2, 0.3))
     th = minimize(f, th0, jac=True, method="L-BFGS-B").x
-    mu, hm, att, dfn = th[0], th[1], th[2:2 + n], th[2 + n:]
+    mu, hm, att, dfn = th[0], th[1], th[2:2 + n], th[2 + n:2 + 2 * n]
+    beta = float(th[2 + 2 * n]) if use_elo else 0.0
 
     rho = 0.0
     if usa_dc:
-        lh = np.exp(mu + hm + att[hi] + dfn[ai])
-        la = np.exp(mu + att[ai] + dfn[hi])
+        lh = np.exp(mu + hm + att[hi] + dfn[ai] + beta * de)
+        la = np.exp(mu + att[ai] + dfn[hi] - beta * de)
         m00, m01, m10, m11 = (x == 0) & (y == 0), (x == 0) & (y == 1), (x == 1) & (y == 0), (x == 1) & (y == 1)
 
         def neg(r):
@@ -352,14 +359,15 @@ def adatta_modello(df, data_rif, ridge, halflife, usa_dc=True):
 
         rho = float(minimize_scalar(neg, bounds=(-0.3, 0.3), method="bounded").x)
 
-    return {"squadre": squadre, "idx": idx, "mu": float(mu), "hm": float(hm), "att": att, "dfn": dfn, "rho": rho}
+    return {"squadre": squadre, "idx": idx, "mu": float(mu), "hm": float(hm), "att": att, "dfn": dfn, "rho": rho, "beta": beta}
 
 
-def lambda_partita(m, casa, trasf):
+def lambda_partita(m, casa, trasf, d_elo=0.0):
     ic, it = m["idx"].get(casa), m["idx"].get(trasf)
     ac, dc = (m["att"][ic], m["dfn"][ic]) if ic is not None else (0.0, 0.0)  # squadra senza storico = media
     at, dt = (m["att"][it], m["dfn"][it]) if it is not None else (0.0, 0.0)
-    return math.exp(m["mu"] + m["hm"] + ac + dt), math.exp(m["mu"] + at + dc)
+    b = m.get("beta", 0.0) * d_elo
+    return math.exp(m["mu"] + m["hm"] + ac + dt + b), math.exp(m["mu"] + at + dc - b)
 
 
 _K = np.arange(11)
@@ -924,6 +932,168 @@ def stagioni_nuove_cached(div, ridge, halflife, passo, giorno, versione):
     return (None, None) if df is None else test_stagioni_nuove(df, ridge, halflife, passo)
 
 
+# ======================= TEST CLUBELO =======================
+ELO_URL = "http://api.clubelo.com"
+ELO_PAESE = {"I1": "ITA", "E0": "ENG", "SP1": "ESP", "D1": "GER", "F1": "FRA", "N1": "NED"}
+_ALIAS_ELO = {
+    "man city": "mancity", "man united": "manunited", "nott m forest": "forest", "wolves": "wolves", "ath madrid": "atletico",
+    "ath bilbao": "athletic", "espanol": "espanyol", "ein frankfurt": "frankfurt", "m gladbach": "gladbach",
+    "bayern munich": "bayern", "paris sg": "psg", "fc koln": "koeln", "for sittard": "sittard", "st etienne": "stetienne",
+    "st pauli": "stpauli", "union berlin": "unionberlin", "inter": "inter", "milan": "milan",
+}
+
+
+def _compatta_elo(nome):
+    n = unicodedata.normalize("NFKD", str(nome or "")).encode("ascii", "ignore").decode().lower()
+    n = re.sub(r"[^a-z0-9 ]", " ", n)
+    n = " ".join(t for t in n.split() if t not in _STOP_NOMI and not t.isdigit())
+    return _ALIAS_ELO.get(n, n).replace(" ", "")
+
+
+def _sim_elo(a, b):
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    if len(a) >= 4 and len(b) >= 4 and (a in b or b in a):
+        return 0.9
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def abbina_elo(squadre, nomi_elo):
+    comp = {n: _compatta_elo(n) for n in nomi_elo}
+    out = {}
+    for t in squadre:
+        ct = _compatta_elo(t)
+        best, bs = None, 0.0
+        for n, c in comp.items():
+            sc = _sim_elo(ct, c)
+            if sc > bs:
+                best, bs = n, sc
+        if best is not None and bs >= 0.8:
+            out[t] = best
+    return out
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def carica_elo(div, squadre, giorno):
+    """Elo storico (ClubElo, gratuito) delle squadre. Ritorna (serie per squadra, squadre non trovate, errore)."""
+    paese = ELO_PAESE.get(div)
+    snap, err = _leggi_csv(f"{ELO_URL}/{giorno}")
+    if snap is None or not {"Club", "Country"}.issubset(snap.columns):
+        return {}, list(squadre), err or "formato inatteso"
+    nomi = snap.loc[snap["Country"] == paese, "Club"].astype(str).unique().tolist()
+    abb = abbina_elo(squadre, nomi)
+    serie = {}
+    for t, nome in abb.items():
+        d, _ = _leggi_csv(f"{ELO_URL}/{nome}")
+        if d is None or not {"Elo", "From", "To"}.issubset(d.columns):
+            continue
+        d["From"] = pd.to_datetime(d["From"], errors="coerce")
+        d["To"] = pd.to_datetime(d["To"], errors="coerce")
+        d = d.dropna(subset=["From", "To", "Elo"]).sort_values("From")
+        if not d.empty:
+            serie[t] = d[["From", "To", "Elo"]].reset_index(drop=True)
+    return serie, [t for t in squadre if t not in serie], None
+
+
+def aggiungi_elo(df, serie):
+    """Elo di ogni squadra il giorno prima della partita (mai quello dopo)."""
+    d = df.copy()
+    d["EloH"], d["EloA"] = np.nan, np.nan
+    prima = (d["Date"] - pd.Timedelta(days=1)).to_numpy()
+    for t, srs in serie.items():
+        froms, tos, elos = srs["From"].to_numpy(), srs["To"].to_numpy(), srs["Elo"].to_numpy(float)
+        for col, tc in (("EloH", "HomeTeam"), ("EloA", "AwayTeam")):
+            m = (d[tc] == t).to_numpy()
+            if not m.any():
+                continue
+            dates = prima[m]
+            idx = np.searchsorted(froms, dates, side="right") - 1
+            ok = (idx >= 0) & (dates <= tos[np.clip(idx, 0, None)])
+            val = np.full(m.sum(), np.nan)
+            val[ok] = elos[idx[ok]]
+            d.loc[m, col] = val
+    d["EloDiff"] = (d["EloH"] - d["EloA"]) / 400.0
+    return d
+
+
+def test_elo(df, ridge, halflife, passo=14):
+    """Walk-forward: stesso modello con e senza la differenza Elo come covariata, sulle stesse partite."""
+    stagioni = sorted(df["Stag"].unique())
+    if len(stagioni) < 2:
+        return None
+    t = df.loc[df["Stag"] == stagioni[1], "Date"].min()
+    fine = df["Date"].max()
+    M0s, M1s, xs, ys, m1x2, ms, betas = [], [], [], [], [], [], []
+    while t <= fine:
+        blocco = df[(df["Date"] >= t) & (df["Date"] < t + pd.Timedelta(days=passo))]
+        train = df[(df["Date"] < t) & (df["Date"] >= t - pd.Timedelta(days=FINESTRA_GIORNI))]
+        if len(blocco) and len(train) >= 150:
+            m0 = adatta_modello(train, t, ridge, halflife, True)
+            m1 = adatta_modello(train, t, ridge, halflife, True, elo_diff=train["EloDiff"].to_numpy())
+            betas.append(m1["beta"])
+            cnt = pd.concat([train["HomeTeam"], train["AwayTeam"]]).value_counts()
+            for _, r in blocco.iterrows():
+                h, a = r["HomeTeam"], r["AwayTeam"]
+                lh0, la0 = lambda_partita(m0, h, a)
+                lh1, la1 = lambda_partita(m1, h, a, r["EloDiff"])
+                M0s.append(matrice_punteggi(lh0, la0, m0["rho"]))
+                M1s.append(matrice_punteggi(lh1, la1, m1["rho"]))
+                xs.append(min(int(r["FTHG"]), 10)); ys.append(min(int(r["FTAG"]), 10))
+                qc = prima_tripla(r, COL_CHIUSURA)
+                m1x2.append(senza_margine(qc) if qc else np.full(3, np.nan))
+                ms.append(int(min(cnt.get(h, 0), cnt.get(a, 0))))
+        t += pd.Timedelta(days=passo)
+    if not xs:
+        return None
+    xs, ys, ms, m1x2 = np.array(xs), np.array(ys), np.array(ms), np.array(m1x2)
+    M0, M1 = np.array(M0s), np.array(M1s)
+    esito, outc = _esiti(xs, ys)
+    righe = []
+    for etichetta, mk in [("1X2", "1x2"), ("Over/Under 1.5", "over1.5"), ("Over/Under 2.5", "over2.5"), ("Over/Under 3.5", "over3.5"),
+                          ("Goal / No Goal", "btts"), ("Risultato esatto (log score)", "exact")]:
+        L0 = _vettore_perdita(M0, mk, xs, ys, outc, esito)
+        L1 = _vettore_perdita(M1, mk, xs, ys, outc, esito)
+        righe.append({"Mercato": etichetta, "Partite": len(xs), "Modello": round(float(L0.mean()), 4), "Modello + Elo": round(float(L1.mean()), 4),
+                      "Modello+Elo − Modello (± err.)": _diff_se(L1, L0)})
+    tab_a = pd.DataFrame(righe)
+    L0 = _vettore_perdita(M0, "1x2", xs, ys, outc, esito)
+    L1 = _vettore_perdita(M1, "1x2", xs, ys, outc, esito)
+    ok_m = ~np.isnan(m1x2).any(axis=1)
+    Lm = np.full(len(xs), np.nan)
+    Lm[ok_m] = -np.log(np.clip(m1x2[ok_m][np.arange(ok_m.sum()), esito[ok_m]], 1e-9, 1))
+    righe_b = []
+    for nome, g in [("Squadra con meno di 15 partite di storico (neopromosse)", ms < 15), ("Tutte le altre", ms >= 15)]:
+        gm = g & ok_m
+        if gm.sum() >= 5:
+            righe_b.append({"Gruppo": nome, "Partite": int(gm.sum()), "Modello": round(float(L0[gm].mean()), 4),
+                            "Modello + Elo": round(float(L1[gm].mean()), 4), "Mercato (chiusura)": round(float(Lm[gm].mean()), 4),
+                            "Modello+Elo − Modello (± err.)": _diff_se(L1[gm], L0[gm]),
+                            "Modello+Elo − Mercato (± err.)": _diff_se(L1[gm], Lm[gm])})
+    return tab_a, pd.DataFrame(righe_b), {"beta": float(np.mean(betas)) if betas else float("nan"), "n": len(xs)}
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def elo_test_cached(div, ridge, halflife, passo, giorno, versione):
+    df = carica_storico(div, N_STAGIONI_TEST, giorno)
+    if df is None:
+        return {"errore": "storico non disponibile"}
+    squadre = tuple(sorted(set(df["HomeTeam"]) | set(df["AwayTeam"])))
+    serie, non_trovate, err = carica_elo(div, squadre, giorno)
+    if err or not serie:
+        return {"errore": f"impossibile scaricare gli Elo da ClubElo ({err or 'nessuna squadra trovata'})"}
+    d2 = aggiungi_elo(df, serie)
+    copertura = float(np.isfinite(d2["EloDiff"]).mean())
+    d2 = d2[np.isfinite(d2["EloDiff"])].reset_index(drop=True)
+    if len(d2) < 400:
+        return {"errore": f"copertura Elo insufficiente ({len(d2)} partite con Elo per entrambe le squadre)", "non_trovate": non_trovate}
+    out = test_elo(d2, ridge, halflife, passo)
+    if out is None:
+        return {"errore": "dati insufficienti per il test"}
+    return {"tab_a": out[0], "tab_b": out[1], "info": out[2], "non_trovate": non_trovate, "copertura": copertura, "n_squadre": len(serie)}
+
+
 # ======================= STATISTICHE, CLASSIFICA =======================
 def stats_attese(df, casa, trasf, k=5):
     """Medie storiche reali (non formule inventate), con shrinkage verso la media del campionato."""
@@ -960,6 +1130,73 @@ def tabella_classifica(df_stag):
         "DR": round((v["GF"] - v["GS"]) / v["G"], 2),
     } for sq, v in righe.items()])
     return out.sort_values(["Punti", "DR"], ascending=False).reset_index(drop=True) if not out.empty else out
+
+
+# ======================= PRONOSTICO, DOPPIA CHANCE, COMBO, MULTIGOL =======================
+_TOT = _I + _J
+_ESITI_MASK = {"1": _MASK["p1"], "X": _MASK["px"], "2": _MASK["p2"],
+               "1X": _MASK["p1"] | _MASK["px"], "X2": _MASK["px"] | _MASK["p2"], "12": _MASK["p1"] | _MASK["p2"]}
+_MERC_MASK = {"Goal": _MASK["btts"], "No Goal": ~_MASK["btts"], "Over 2.5": _MASK["over2.5"], "Under 2.5": ~_MASK["over2.5"]}
+NOMI_ESITO = {"1": "1 (Casa)", "X": "X (Pareggio)", "2": "2 (Trasferta)"}
+
+
+def matrice_congiunta(M_1x2, M_gol):
+    """Distribuzione dei punteggi che ha i marginali 1X2 di M_1x2 e la struttura dei gol di M_gol."""
+    out = M_gol.copy()
+    for chiave in ("p1", "px", "p2"):
+        mask = _MASK[chiave]
+        pg, po = M_gol[mask].sum(), M_1x2[mask].sum()
+        if pg > 0:
+            out[mask] *= po / pg
+    return out / out.sum()
+
+
+def _riga_prob(etichetta, p):
+    return {"Mercato": etichetta, "Probabilità %": round(float(p) * 100, 1), "Quota equa": round(1 / p, 2) if p > 1e-6 else None}
+
+
+def tabelle_pronostico(M_1x2, M_gol):
+    Mj = matrice_congiunta(M_1x2, M_gol)
+    p = {k: float(M_1x2[m].sum()) for k, m in _ESITI_MASK.items()}
+    out = {"p": p}
+    best = max(("1", "X", "2"), key=lambda k: p[k])
+    out["pronostico"] = best
+    out["doppie"] = pd.DataFrame([_riga_prob(k, p[k]) for k in ("1X", "X2", "12")]).sort_values("Probabilità %", ascending=False)
+    out["doppia_best"] = max(("1X", "X2", "12"), key=lambda k: p[k])
+
+    def combo(esiti, mercati):
+        righe = [(f"{e} + {m}", float(Mj[_ESITI_MASK[e] & _MERC_MASK[m]].sum())) for e in esiti for m in mercati]
+        return pd.DataFrame([_riga_prob(l, v) for l, v in sorted(righe, key=lambda r: -r[1])])
+    out["combo_goal"] = combo(("1", "X", "2"), ("Goal", "No Goal"))
+    out["combo_ou"] = combo(("1", "X", "2"), ("Over 2.5", "Under 2.5"))
+    out["combo_doppie"] = combo(("1X", "X2", "12"), ("Goal", "No Goal", "Over 2.5", "Under 2.5"))
+    # Multigol (totale e per squadra) dalla distribuzione dei gol
+    out["multigol_tot"] = pd.DataFrame([_riga_prob(f"{a}-{b} gol", M_gol[(_TOT >= a) & (_TOT <= b)].sum())
+                                        for a, b in [(1, 2), (1, 3), (1, 4), (1, 5), (2, 3), (2, 4), (2, 5), (3, 5), (3, 6)]])
+    larghi3 = {f"{a}-{b}": float(M_gol[(_TOT >= a) & (_TOT <= b)].sum()) for a, b in [(1, 3), (2, 4), (3, 5)]}
+    out["multigol_best"] = max(larghi3, key=larghi3.get)
+    out["multigol_best_p"] = larghi3[out["multigol_best"]]
+    out["multigol_casa"] = pd.DataFrame([_riga_prob(f"Casa {a}-{b} gol", M_gol[(_I >= a) & (_I <= b)].sum()) for a, b in [(1, 2), (1, 3), (2, 3), (2, 4)]])
+    out["multigol_trasf"] = pd.DataFrame([_riga_prob(f"Trasferta {a}-{b} gol", M_gol[(_J >= a) & (_J <= b)].sum()) for a, b in [(1, 2), (1, 3), (2, 3), (2, 4)]])
+    return out
+
+
+def diagnostica_pareggi(bt):
+    """Il modello sottostima i pareggi? Confronto per fasce di equilibrio tra 1 e 2."""
+    gap = (bt["p1"] - bt["p2"]).abs().to_numpy()
+    reale = (bt["y"].to_numpy() == 1).astype(float)
+    px = bt["px"].to_numpy()
+    mkt = bt["mx"].to_numpy()
+    righe = []
+    for etichetta, sel in [("Differenza 1-2 fino a 4 punti", gap <= 0.04), ("fino a 8 punti", gap <= 0.08), ("fino a 12 punti", gap <= 0.12),
+                           ("fino a 20 punti", gap <= 0.20), ("Tutte le partite", gap >= 0)]:
+        if sel.sum() >= 10:
+            righe.append({"Fascia": etichetta, "Partite": int(sel.sum()), "X prevista dal modello %": round(float(px[sel].mean() * 100), 1),
+                          "X reale %": round(float(reale[sel].mean() * 100), 1),
+                          "X prevista dal mercato %": round(float(np.nanmean(mkt[sel]) * 100), 1) if np.isfinite(mkt[sel]).any() else None})
+    top = np.argmax(bt[["p1", "px", "p2"]].to_numpy(), axis=1)
+    n_top_x = int((top == 1).sum())
+    return pd.DataFrame(righe), n_top_x
 
 
 # ======================= INTERFACCIA =======================
@@ -1098,6 +1335,19 @@ def mostra_analisi(casa, trasf, data, ora):
     if not d["ancorata"]:
         st.warning("⚠ Senza le quote del bookmaker, Goal/No Goal e Over/Under hanno poco potere predittivo: nel backtest su circa 1200 partite "
                    "non hanno battuto in modo netto le semplici frequenze storiche. Considerali indicativi, vicini alla media del campionato.")
+    pr = tabelle_pronostico(d["M_1x2"], d["M_gol"])
+    pp = pr["p"]
+    st.markdown("#### 🎯 Il pronostico")
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("Pronostico 1X2", NOMI_ESITO[pr["pronostico"]], f"{pp[pr['pronostico']]*100:.1f}%", delta_color="off")
+    r2.metric("Doppia chance più probabile", pr["doppia_best"], f"{pp[pr['doppia_best']]*100:.1f}%", delta_color="off")
+    cg = pr["combo_goal"].iloc[0]
+    r3.metric("Combo più probabile (1X2 + Goal)", cg["Mercato"], f"{cg['Probabilità %']:.1f}%", delta_color="off")
+    r4.metric("Multigol più probabile (3 gol)", pr["multigol_best"] + " gol", f"{pr['multigol_best_p']*100:.1f}%", delta_color="off")
+    gap = abs(pp["1"] - pp["2"]) * 100
+    st.caption(f"La X vale {pp['X']*100:.1f}% e la differenza tra 1 e 2 è di {gap:.1f} punti. La X è quasi mai l'esito singolo più probabile (succede solo "
+               "nelle partite molto equilibrate, anche con le quote del mercato): per questo nelle partite equilibrate conviene guardare la doppia chance. "
+               "Nel Backtest, sezione 'Il pareggio', trovi se il modello sottostima i pareggi.")
     a1, a2, a3 = st.columns(3)
     a1.metric("Segno 1 (Casa)", f"{mk['p1']*100:.1f}%", f"Quota equa: {1/mk['p1']:.2f}")
     a2.metric("Segno X (Pareggio)", f"{mk['px']*100:.1f}%", f"Quota equa: {1/mk['px']:.2f}")
@@ -1113,6 +1363,26 @@ def mostra_analisi(casa, trasf, data, ora):
     flat = sorted(((i, j, M[i, j]) for i in range(M.shape[0]) for j in range(M.shape[1])), key=lambda t: t[2], reverse=True)[:3]
     for col, medaglia, nome, (i, j, p) in zip(st.columns(3), ["🥇", "🥈", "🥉"], ["1°", "2°", "3°"], flat):
         col.info(f"{medaglia} {nome} Esatto: **{i} - {j}** ({p*100:.1f}%)")
+    st.markdown("#### 🛡️ Doppia chance")
+    st.dataframe(pr["doppie"], use_container_width=True, hide_index=True)
+    st.markdown("#### 🔗 Combo")
+    cc1, cc2 = st.columns(2)
+    cc1.markdown("**1X2 + Goal / No Goal**")
+    cc1.dataframe(pr["combo_goal"], use_container_width=True, hide_index=True)
+    cc2.markdown("**1X2 + Over / Under 2.5**")
+    cc2.dataframe(pr["combo_ou"], use_container_width=True, hide_index=True)
+    with st.expander("Doppia chance + Goal / Over-Under 2.5"):
+        st.dataframe(pr["combo_doppie"], use_container_width=True, hide_index=True)
+    st.markdown("#### 🎰 Multigol")
+    mm1, mm2, mm3 = st.columns(3)
+    mm1.markdown("**Totale partita**")
+    mm1.dataframe(pr["multigol_tot"], use_container_width=True, hide_index=True)
+    mm2.markdown("**Squadra di casa**")
+    mm2.dataframe(pr["multigol_casa"], use_container_width=True, hide_index=True)
+    mm3.markdown("**Squadra in trasferta**")
+    mm3.dataframe(pr["multigol_trasf"], use_container_width=True, hide_index=True)
+    st.caption("Combo e multigol sono calcolati dalla stessa distribuzione dei punteggi: l'1X2 è quello mostrato sopra, i gol seguono la fonte indicata. "
+               "Un multigol più largo è sempre più probabile ma paga meno: confronta sempre la quota equa con quella offerta.")
     if d["ancorata"]:
         st.caption("Con le quote reali le probabilità 1X2 coincidono con quelle del mercato (senza margine): non c'è edge da cercare qui.")
     if casa not in modello["idx"] or trasf not in modello["idx"]:
@@ -1308,6 +1578,13 @@ with tab_backtest:
             st.dataframe(tb, use_container_width=True, hide_index=True)
             st.caption("Il ROI su poche centinaia di scommesse è molto rumoroso: guarda l'errore (± ROI) e il CLV. "
                        "Un CLV medio positivo e stabile è un segnale più affidabile del ROI.")
+        st.markdown("#### 🎲 Il pareggio (X): il modello lo sottostima?")
+        dg, n_top_x = diagnostica_pareggi(bt)
+        if not dg.empty:
+            st.dataframe(dg, use_container_width=True, hide_index=True)
+            st.caption(f"In {n_top_x} partite su {len(bt)} la X era l'esito più probabile secondo il modello. Se 'X reale' è molto più alto di 'X prevista dal modello' "
+                       "nelle partite equilibrate, il modello sottostima i pareggi; se è vicino (o vicino a quella del mercato), la X non compare perché non è quasi mai "
+                       "l'esito più probabile, non per un errore.")
         st.markdown("#### 🎯 Calibrazione: probabilità prevista vs frequenza reale")
         cal = tabella_calibrazione(bt)
         if not cal.empty:
@@ -1374,6 +1651,33 @@ with tab_backtest:
         st.caption("Se 'Misto − Frequenze' è negativo e più grande di circa 2 volte l'errore, il misto batte davvero le frequenze fuori campione.")
     elif sn is not None:
         st.warning("Dati insufficienti per questo test: servono almeno 3 stagioni.")
+
+    st.markdown("---")
+    st.markdown("### 🧭 Test ClubElo (rating Elo delle squadre)")
+    st.caption("Aggiunge al modello la differenza di Elo tra le due squadre (dati gratuiti di clubelo.com, presi il giorno prima di ogni partita). "
+               "Serve soprattutto per le squadre con pochi dati, come le neopromosse. Si tiene solo se migliora oltre l'errore. "
+               "È un test: non cambia le previsioni dell'app.")
+    if st.button("🧭 Esegui test ClubElo"):
+        with st.spinner("Scarico gli Elo e calcolo (può richiedere alcuni minuti la prima volta)..."):
+            st.session_state["elo"] = elo_test_cached(div, par["ridge"], par["halflife"], 14, giorno, VERSIONE_TEST)
+            st.session_state["elo_div"] = div
+    eo = st.session_state.get("elo") if st.session_state.get("elo_div") == div else None
+    if eo is not None and "errore" in eo:
+        st.warning(f"Test non eseguito: {eo['errore']}.")
+        if eo.get("non_trovate"):
+            st.caption("Squadre senza Elo (nomi diversi tra football-data e ClubElo): " + ", ".join(eo["non_trovate"]))
+    elif eo is not None:
+        e1, e2, e3 = st.columns(3)
+        e1.metric("Squadre con Elo", f"{eo['n_squadre']}")
+        e2.metric("Partite con Elo (copertura)", f"{eo['copertura']*100:.0f}%")
+        e3.metric("Peso medio dell'Elo (β)", f"{eo['info']['beta']:.2f}")
+        st.dataframe(eo["tab_a"], use_container_width=True, hide_index=True)
+        st.caption("Log loss, più basso è meglio. Se la differenza 'Modello+Elo − Modello' è negativa e più grande di circa 2 volte l'errore, l'Elo migliora davvero.")
+        if not eo["tab_b"].empty:
+            st.markdown("#### 🆕 Squadre con poca storia contro tutte le altre")
+            st.dataframe(eo["tab_b"], use_container_width=True, hide_index=True)
+        if eo.get("non_trovate"):
+            st.caption("Squadre senza Elo (escluse dal test): " + ", ".join(eo["non_trovate"]))
 
 # --- VALUE BET (KELLY) ---
 with tab_kelly:
