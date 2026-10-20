@@ -1,6 +1,6 @@
-
 import difflib
 import io
+import time
 import math
 import re
 import unicodedata
@@ -175,29 +175,107 @@ def prima_tripla(riga, colonne):
     return None
 
 
-def senza_margine(quote):
-    p = 1.0 / np.asarray(quote, dtype=float)
+METODO_MARGINE = {"m": "proporzionale"}
+
+
+def _devig_potenza(pi):
+    lo, hi = 1.0, 10.0
+    for _ in range(60):
+        k = (lo + hi) / 2
+        if (pi ** k).sum() > 1:
+            lo = k
+        else:
+            hi = k
+    p = pi ** ((lo + hi) / 2)
     return p / p.sum()
 
 
+def _devig_shin(pi):
+    B = pi.sum()
+
+    def somma(z):
+        return ((np.sqrt(z * z + 4 * (1 - z) * pi * pi / B) - z) / (2 * (1 - z))).sum()
+    if somma(0.0) <= 1:
+        return pi / B
+    lo, hi = 0.0, 0.5
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        if somma(mid) > 1:
+            lo = mid
+        else:
+            hi = mid
+    z = (lo + hi) / 2
+    p = (np.sqrt(z * z + 4 * (1 - z) * pi * pi / B) - z) / (2 * (1 - z))
+    return p / p.sum()
+
+
+def senza_margine(quote, metodo=None):
+    """Probabilità implicite delle quote senza il margine del bookmaker. Il metodo (proporzionale, potenza o Shin) lo sceglie il backtest."""
+    pi = 1.0 / np.asarray(quote, dtype=float)
+    metodo = metodo or METODO_MARGINE["m"]
+    if metodo == "potenza":
+        return _devig_potenza(pi)
+    if metodo == "shin":
+        return _devig_shin(pi)
+    return pi / pi.sum()
+
+
+def scegli_metodo_margine(df):
+    """Quale metodo per togliere il margine dà le probabilità più accurate? Confronto sul log loss delle quote di apertura (quelle usate
+    dall'app) e di chiusura, su tutte le partite con quote. Si cambia dal proporzionale solo con un miglioramento chiaro."""
+    metodi = ("proporzionale", "potenza", "shin")
+    perdite = {m: {"ap": [], "ch": []} for m in metodi}
+    for _, r in df.iterrows():
+        es = 0 if r["FTHG"] > r["FTAG"] else (1 if r["FTHG"] == r["FTAG"] else 2)
+        qa, qc = prima_tripla(r, COL_PRESA), prima_tripla(r, COL_CHIUSURA)
+        for m in metodi:
+            if qa:
+                perdite[m]["ap"].append(-math.log(max(float(senza_margine(qa, m)[es]), 1e-9)))
+            if qc:
+                perdite[m]["ch"].append(-math.log(max(float(senza_margine(qc, m)[es]), 1e-9)))
+    righe = []
+    base = np.array(perdite["proporzionale"]["ap"])
+    for m in metodi:
+        ap, ch = np.array(perdite[m]["ap"]), np.array(perdite[m]["ch"])
+        if len(ap) < 100:
+            return "proporzionale", pd.DataFrame()
+        righe.append({"Metodo": m, "Partite (apertura)": len(ap), "Log loss apertura": round(float(ap.mean()), 4),
+                      "Differenza dal proporzionale (± err.)": "" if m == "proporzionale" else _diff_se(ap, base),
+                      "Log loss chiusura": round(float(ch.mean()), 4) if len(ch) else None})
+    best = min(metodi, key=lambda m: float(np.mean(perdite[m]["ap"])))
+    d_best = np.array(perdite[best]["ap"]) - base
+    scelto = best if (best != "proporzionale" and d_best.mean() < 0 and abs(d_best.mean()) >= 1.0 * d_best.std(ddof=1) / math.sqrt(len(d_best))) else "proporzionale"
+    tab = pd.DataFrame(righe)
+    tab["Usato dall'app"] = ["sì" if r["Metodo"] == scelto else "" for r in righe]
+    return scelto, tab
+
+
 def _leggi_csv(url):
-    """Ritorna (DataFrame, None) oppure (None, motivo). Gestisce il BOM UTF-8 che football-data.co.uk mette in fixtures.csv."""
-    try:
-        res = requests.get(url, timeout=20, headers=UA)
-    except Exception as e:
-        return None, f"connessione fallita ({type(e).__name__})"
-    if res.status_code != 200:
-        return None, f"risposta HTTP {res.status_code}"
-    for enc in ("utf-8-sig", "latin-1"):
+    """Ritorna (DataFrame, None) oppure (None, motivo). Gestisce il BOM UTF-8 e riprova (fino a 3 volte) se il server risponde con un errore 5xx o non risponde."""
+    ultimo = "errore sconosciuto"
+    for tentativo in range(3):
         try:
-            d = pd.read_csv(io.BytesIO(res.content), encoding=enc, on_bad_lines="skip")
-            d.columns = [str(c).strip().lstrip("\ufeff") for c in d.columns]
-            return d, None
-        except UnicodeDecodeError:
-            continue
+            res = requests.get(url, timeout=20, headers=UA)
         except Exception as e:
-            return None, f"file non leggibile ({type(e).__name__})"
-    return None, "codifica non riconosciuta"
+            ultimo = f"connessione fallita ({type(e).__name__})"
+        else:
+            if res.status_code == 200:
+                for enc in ("utf-8-sig", "latin-1"):
+                    try:
+                        d = pd.read_csv(io.BytesIO(res.content), encoding=enc, on_bad_lines="skip")
+                        d.columns = [str(c).strip().lstrip("\ufeff") for c in d.columns]
+                        return d, None
+                    except UnicodeDecodeError:
+                        continue
+                    except Exception as e:
+                        return None, f"file non leggibile ({type(e).__name__})"
+                return None, "codifica non riconosciuta"
+            ultimo = f"risposta HTTP {res.status_code}"
+            if res.status_code < 500 and res.status_code != 429:
+                return None, ultimo
+        if tentativo < 2:
+            time.sleep(2 + 3 * tentativo)
+    return None, ultimo
 
 
 @st.cache_data(ttl=6 * 3600)
@@ -722,8 +800,7 @@ def tabella_roi(res, ok_mask, esito):
     if sel.sum() < 50:
         return pd.DataFrame()
     Qs, es = Q[sel], esito[sel]
-    pf = 1 / Qs
-    pf = pf / pf.sum(axis=1, keepdims=True)
+    pf = np.array([senza_margine(q_) for q_ in Qs])
     righe = []
     for i, nome in enumerate(["1 (Casa)", "X (Pareggio)", "2 (Trasferta)"]):
         win = es == i
@@ -752,7 +829,6 @@ def tabella_tempi_test(res, ok_mask, pesi=None):
     h2 = (xs - ht[:, 0]) + (ys - ht[:, 1])
     Mb, Mf, Ma = res["Ms"]["Modello"], res["Ms"]["Frequenze storiche"], res["Ms"]["Ancorato al mercato"]
     w = pesi["gol"] if pesi else 0.5
-    dl = pesi["delta"] if (pesi and "delta" in pesi) else DELTA_ZERO
     mercati_t = [("1° tempo almeno 1 gol", lambda p1, p2, pm: 1 - p1[0], lambda a, b: a >= 1),
                  ("1° tempo almeno 2 gol", lambda p1, p2, pm: 1 - p1[0] - p1[1], lambda a, b: a >= 2),
                  ("2° tempo almeno 1 gol", lambda p1, p2, pm: 1 - p2[0], lambda a, b: b >= 1),
@@ -763,8 +839,8 @@ def tabella_tempi_test(res, ok_mask, pesi=None):
                  ("Secondo tempo più gol", lambda p1, p2, pm: np.triu(pm, 1).sum(), lambda a, b: a < b)]
     righe = []
     for nome_f, sel, costruisci in (
-            ("APP senza quote", ha_ht, lambda i: ricalibra_matrice(w * Mb[i] + (1 - w) * Mf[i], dl["blend"])),
-            ("APP con quote", ha_ht & ok_mask, lambda i: ricalibra_matrice(Ma[i], dl["ancorato"]))):
+            ("APP senza quote", ha_ht, lambda i: w * Mb[i] + (1 - w) * Mf[i]),
+            ("APP con quote", ha_ht & ok_mask, lambda i: Ma[i])):
         idx = np.where(sel)[0]
         if len(idx) < 50:
             continue
@@ -908,12 +984,9 @@ def tabelle_test(res, pesi=None):
         w_c = peso_mk[mk]
         fonti = {"Modello da solo": Mb_c, f"Modello+Frequenze (peso modello {int(w_c * 100)}%)": w_c * Mb_c + (1 - w_c) * Mf_c,
                  "Ancorato al mercato": res["Ms"]["Ancorato al mercato"][sel_c]}
-        if pesi is not None and "delta" in pesi:
+        if pesi is not None:
             w_l = pesi["gol"]
-            Mw_l = w_l * Mb_c + (1 - w_l) * Mf_c
-            fonti[f"APP senza quote, senza correzione (peso {int(w_l * 100)}%)"] = Mw_l
-            fonti["APP senza quote, CON correzione"] = np.array([ricalibra_matrice(m_, pesi["delta"]["blend"]) for m_ in Mw_l])
-            fonti["APP con quote, CON correzione"] = np.array([ricalibra_matrice(m_, pesi["delta"]["ancorato"]) for m_ in res["Ms"]["Ancorato al mercato"][sel_c]])
+            fonti[f"APP senza quote (peso modello {int(w_l * 100)}%)"] = w_l * Mb_c + (1 - w_l) * Mf_c
         o_c = outc[mk][sel_c]
         for nome_f, Mv in fonti.items():
             pm = _p_mercato(Mv, mk)
@@ -935,63 +1008,6 @@ def test_completo_cached(div, ridge, halflife, passo, giorno, versione):
     return None if df is None else esegui_test_completo(df, ridge, halflife, passo)
 
 
-def _logit(p):
-    p = np.clip(np.asarray(p, float), 1e-4, 1 - 1e-4)
-    return np.log(p / (1 - p))
-
-
-def _sig(z):
-    return 1 / (1 + np.exp(-z))
-
-
-def _delta_intercetta(p, o):
-    """Spostamento (in scala logit) da applicare alle probabilità p perché la media coincida con la frequenza reale di o."""
-    target, z = float(np.mean(o)), _logit(p)
-    lo, hi = -2.0, 2.0
-    for _ in range(40):
-        mid = (lo + hi) / 2
-        if _sig(z + mid).mean() < target:
-            lo = mid
-        else:
-            hi = mid
-    return float((lo + hi) / 2)
-
-
-def ricalibra_matrice(M, delta):
-    """Sposta P(Goal) e P(Over 2.5) della distribuzione dei punteggi di `delta` (logit), lasciando il resto della struttura."""
-    chiavi = [k for k in ("btts", "over2.5") if abs(delta.get(k, 0.0)) > 1e-9]
-    if not chiavi:
-        return M
-    tgt = {k: float(_sig(_logit(M[_MASK[k]].sum()) + delta[k])) for k in chiavi}
-    out = M.copy()
-    for _ in range(6):
-        for k in chiavi:
-            pk = out[_MASK[k]].sum()
-            if 1e-9 < pk < 1 - 1e-9:
-                out = np.where(_MASK[k], out * (tgt[k] / pk), out * ((1 - tgt[k]) / (1 - pk)))
-        out = out / out.sum()
-    return out
-
-
-DELTA_ZERO = {"blend": {"btts": 0.0, "over2.5": 0.0}, "ancorato": {"btts": 0.0, "over2.5": 0.0}}
-
-
-def stima_delta(res, w_gol):
-    """Correzione di Goal e Over 2.5 per le due fonti usate dall'app (misto senza quote, ancorato con le quote)."""
-    xs, ys = res["xs"], res["ys"]
-    _, outc = _esiti(xs, ys)
-    Mw = w_gol * res["Ms"]["Modello"] + (1 - w_gol) * res["Ms"]["Frequenze storiche"]
-    out = {"blend": {}, "ancorato": {}}
-    for mk in ("btts", "over2.5"):
-        out["blend"][mk] = _delta_intercetta(_p_mercato(Mw, mk), outc[mk])
-        sel = res["ou_ok"] if mk == "over2.5" else res["ok"]
-        if sel.sum() >= 100:
-            out["ancorato"][mk] = _delta_intercetta(_p_mercato(res["Ms"]["Ancorato al mercato"][sel], mk), outc[mk][sel])
-        else:
-            out["ancorato"][mk] = 0.0
-    return out
-
-
 def _campioni(M1x2, Mgol, esito, outc):
     """Coppie (probabilità prevista, è successo) per ogni esito/mercato mostrato dall'app, raggruppate per tipo."""
     p1, px, p2 = (_p_mercato(M1x2, k) for k in ("p1", "px", "p2"))
@@ -1009,17 +1025,15 @@ def _campioni(M1x2, Mgol, esito, outc):
             "ou": (np.concatenate(pred_ou), np.concatenate(hit_ou))}
 
 
-def costruisci_curve(res, delta, w_gol):
+def costruisci_curve(res, w_gol):
     """Affidabilità storica delle percentuali nelle due situazioni dell'app: senza quote e con quote."""
     esito, outc = _esiti(res["xs"], res["ys"])
     Mb, Mf, Ma = res["Ms"]["Modello"], res["Ms"]["Frequenze storiche"], res["Ms"]["Ancorato al mercato"]
     Mw = w_gol * Mb + (1 - w_gol) * Mf
-    Mg_senza = np.array([ricalibra_matrice(m_, delta["blend"]) for m_ in Mw])
-    out = {"senza": _campioni(Mb, Mg_senza, esito, outc)}
+    out = {"senza": _campioni(Mb, Mw, esito, outc)}
     sel = res["ou_ok"]
     if sel.sum() >= 100:
-        Mg_con = np.array([ricalibra_matrice(m_, delta["ancorato"]) for m_ in Ma[sel]])
-        out["con"] = _campioni(Ma[sel], Mg_con, esito[sel], {k: v[sel] for k, v in outc.items()})
+        out["con"] = _campioni(Ma[sel], Ma[sel], esito[sel], {k: v[sel] for k, v in outc.items()})
     return out
 
 
@@ -1051,16 +1065,20 @@ def tabella_affidabilita(curve):
     return pd.DataFrame(righe)
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner="Calcolo i pesi e la correzione di Goal/Over dal backtest (solo la prima volta di giornata)...")
+@st.cache_data(ttl=6 * 3600, show_spinner="Calcolo pesi e affidabilità dal backtest (solo la prima volta di giornata)...")
 def pesi_blend_auto(div, ridge, halflife, giorno):
-    """Dal backtest: peso del modello senza quote (resto: frequenze storiche) e correzione automatica di Goal e Over 2.5."""
+    """Dal backtest: metodo per togliere il margine dalle quote, peso del modello senza quote (resto: frequenze storiche),
+    soglia per la X e affidabilità storica delle percentuali."""
     df = carica_storico(div, N_STAGIONI_TEST, giorno)
+    metodo, tab_margine = scegli_metodo_margine(df) if df is not None else ("proporzionale", pd.DataFrame())
+    METODO_MARGINE["m"] = metodo
     res = esegui_test_completo(df, ridge, halflife, 28, leggero=True) if df is not None else None
     if res is None or len(res["xs"]) < 100:
-        return {"gol": 0.5, "esatto": 0.75, "n": 0, "auto": False, "delta": DELTA_ZERO, "soglia_x": {"modello": None, "ancorato": None}, "curve": {}}
+        return {"gol": 0.5, "esatto": 0.75, "n": 0, "auto": False, "soglia_x": {"modello": None, "ancorato": None}, "curve": {},
+                "metodo_margine": metodo, "tab_margine": tab_margine}
     w = pesi_ottimi(res)
     w["auto"] = True
-    w["delta"] = stima_delta(res, w["gol"])
+    w["metodo_margine"], w["tab_margine"] = metodo, tab_margine
     es_, _ = _esiti(res["xs"], res["ys"])
     P_mod = np.stack([_p_mercato(res["Ms"]["Modello"], k_) for k_ in ("p1", "px", "p2")], axis=1)
     sx = {"modello": trova_soglia_x(P_mod, es_), "ancorato": None}
@@ -1068,7 +1086,7 @@ def pesi_blend_auto(div, ridge, halflife, giorno):
         P_anc = np.stack([_p_mercato(res["Ms"]["Ancorato al mercato"][res["ok"]], k_) for k_ in ("p1", "px", "p2")], axis=1)
         sx["ancorato"] = trova_soglia_x(P_anc, es_[res["ok"]])
     w["soglia_x"] = sx
-    w["curve"] = costruisci_curve(res, w["delta"], w["gol"])
+    w["curve"] = costruisci_curve(res, w["gol"])
     return w
 
 
@@ -1089,7 +1107,7 @@ def test_stagioni_nuove(df, ridge_att, halflife_att, passo=14):
     poi si misura la qualità sulla stagione stessa, mai vista in fase di scelta."""
     stagioni = sorted(df["Stag"].unique())
     righe, tutte = [], {"new": [], "att": [], "mkt": [], "freq": []}
-    perd = {mk: {"Modello": [], "Frequenze": [], "Misto": [], "Calibrato": []} for _, mk in MERCATI_GOL}
+    perd = {mk: {"Modello": [], "Frequenze": [], "Misto": []} for _, mk in MERCATI_GOL}
     pesi_usati = {"gol": [], "esatto": []}
     for k in stagioni[2:]:
         t0 = df.loc[df["Stag"] == k, "Date"].min()
@@ -1125,15 +1143,11 @@ def test_stagioni_nuove(df, ridge_att, halflife_att, passo=14):
         righe.append(riga)
         # mercati gol/esatti: peso scelto sulle stagioni precedenti
         Mb, Mf = rn["Ms"]["Modello"], rn["Ms"]["Frequenze storiche"]
-        dl = stima_delta(res_prev, w["gol"])["blend"]  # correzione stimata SOLO sulle stagioni precedenti
-        Mcal = np.array([ricalibra_matrice(w["gol"] * Mb[i] + (1 - w["gol"]) * Mf[i], dl) for i in range(n)])
         for _, mk in MERCATI_GOL:
             wk = w["esatto"] if mk == "exact" else w["gol"]
             perd[mk]["Modello"].append(_vettore_perdita(Mb, mk, xs, ys, outc, esito))
             perd[mk]["Frequenze"].append(_vettore_perdita(Mf, mk, xs, ys, outc, esito))
-            Lmix = _vettore_perdita(wk * Mb + (1 - wk) * Mf, mk, xs, ys, outc, esito)
-            perd[mk]["Misto"].append(Lmix)
-            perd[mk]["Calibrato"].append(Lmix if mk == "exact" else _vettore_perdita(Mcal, mk, xs, ys, outc, esito))
+            perd[mk]["Misto"].append(_vettore_perdita(wk * Mb + (1 - wk) * Mf, mk, xs, ys, outc, esito))
         pesi_usati["gol"].append(f"{etichetta.split(' ')[0]}: {int(w['gol'] * 100)}")
         pesi_usati["esatto"].append(f"{etichetta.split(' ')[0]}: {int(w['esatto'] * 100)}")
     if not righe:
@@ -1149,13 +1163,11 @@ def test_stagioni_nuove(df, ridge_att, halflife_att, passo=14):
     tab1 = pd.DataFrame(righe + [riga])
     righe2 = []
     for etichetta, mk in MERCATI_GOL:
-        M_, F_, X_, C_ = (np.concatenate(perd[mk][v]) for v in ("Modello", "Frequenze", "Misto", "Calibrato"))
+        M_, F_, X_ = (np.concatenate(perd[mk][v]) for v in ("Modello", "Frequenze", "Misto"))
         pesi_txt = " · ".join(pesi_usati["esatto" if mk == "exact" else "gol"])
         righe2.append({"Mercato": etichetta, "Partite": len(M_), "Modello": round(float(M_.mean()), 4), "Frequenze storiche": round(float(F_.mean()), 4),
                        "Misto (pesi scelti prima)": round(float(X_.mean()), 4), "Peso modello % per stagione": pesi_txt,
-                       "Misto + correzione (scelta prima)": round(float(C_.mean()), 4),
-                       "Misto − Frequenze (± err.)": _diff_se(X_, F_), "Misto − Modello (± err.)": _diff_se(X_, M_),
-                       "Corretto − Misto (± err.)": _diff_se(C_, X_)})
+                       "Misto − Frequenze (± err.)": _diff_se(X_, F_), "Misto − Modello (± err.)": _diff_se(X_, M_)})
     return tab1, pd.DataFrame(righe2)
 
 
@@ -1166,7 +1178,7 @@ def stagioni_nuove_cached(div, ridge, halflife, passo, giorno, versione):
 
 
 # ======================= TEST CLUBELO =======================
-ELO_URL = "http://api.clubelo.com"
+ELO_BASI = ["http://api.clubelo.com", "https://api.clubelo.com"]
 ELO_PAESE = {"I1": "ITA", "E0": "ENG", "SP1": "ESP", "D1": "GER", "F1": "FRA", "N1": "NED"}
 _ALIAS_ELO = {
     "man city": "mancity", "man united": "manunited", "nott m forest": "forest", "wolves": "wolves", "ath madrid": "atletico",
@@ -1203,7 +1215,7 @@ def abbina_elo(squadre, nomi_elo):
             sc = _sim_elo(ct, c)
             if sc > bs:
                 best, bs = n, sc
-        if best is not None and bs >= 0.8:
+        if best is not None and bs >= 0.88:
             out[t] = best
     return out
 
@@ -1212,14 +1224,26 @@ def abbina_elo(squadre, nomi_elo):
 def carica_elo(div, squadre, giorno):
     """Elo storico (ClubElo, gratuito) delle squadre. Ritorna (serie per squadra, squadre non trovate, errore)."""
     paese = ELO_PAESE.get(div)
-    snap, err = _leggi_csv(f"{ELO_URL}/{giorno}")
+
+    base_ok = {"b": None}
+
+    def leggi_elo(percorso):
+        err_ = None
+        for base in ([base_ok["b"]] if base_ok["b"] else ELO_BASI):  # prima http, poi https; dopo il primo successo si usa solo quella
+            d_, err_ = _leggi_csv(f"{base}/{percorso}")
+            if d_ is not None:
+                base_ok["b"] = base
+                return d_, None
+        return None, err_
+
+    snap, err = leggi_elo(giorno)
     if snap is None or not {"Club", "Country"}.issubset(snap.columns):
         return {}, list(squadre), err or "formato inatteso"
     nomi = snap.loc[snap["Country"] == paese, "Club"].astype(str).unique().tolist()
     abb = abbina_elo(squadre, nomi)
     serie = {}
     for t, nome in abb.items():
-        d, _ = _leggi_csv(f"{ELO_URL}/{nome}")
+        d, _ = leggi_elo(nome)
         if d is None or not {"Elo", "From", "To"}.issubset(d.columns):
             continue
         d["From"] = pd.to_datetime(d["From"], errors="coerce")
@@ -1604,6 +1628,7 @@ calendario, fonte_cal = costruisci_calendario(div, df_storico, fx, chiave_api, m
 
 # Quote del prossimo turno (1X2 + Over/Under 2.5 senza margine) e distribuzione dei punteggi "migliore disponibile"
 pesi = pesi_blend_auto(div, par["ridge"], par["halflife"], giorno)
+METODO_MARGINE["m"] = pesi.get("metodo_margine", "proporzionale")
 M_freq_live = matrice_frequenze(df_storico)
 freq_combo = frequenze_combo(df_storico)
 quota_pt = quota_primo_tempo(df_storico)
@@ -1620,24 +1645,15 @@ def distribuzione(casa, trasf):
     Senza quote: 1X2 dal modello; Goal/Over/Esatti da modello + frequenze storiche (pesi scelti dal backtest)."""
     lh, la = lambda_partita(modello, casa, trasf)
     Mb = matrice_punteggi(lh, la, modello["rho"])
-    delta = pesi.get("delta", DELTA_ZERO)
     q = quote_fixtures.get((casa, trasf))
-
-    def testo_corr(M0, M1):
-        dg = (M1[_MASK["btts"]].sum() - M0[_MASK["btts"]].sum()) * 100
-        do = (M1[_MASK["over2.5"]].sum() - M0[_MASK["over2.5"]].sum()) * 100
-        return f"; correzione automatica: Goal {dg:+.1f} e Over 2.5 {do:+.1f} punti"
-
     if q is not None:
         Ma = matrice_ancorata(q[0], q[1], modello["rho"], (lh, la))
-        Mc = ricalibra_matrice(Ma, delta["ancorato"])
-        return {"M_1x2": Ma, "M_gol": Mc, "M_es": Ma, "ancorata": True,
-                "fonte": "ancorata alle quote reali del bookmaker (1X2 + Over/Under 2.5)" + testo_corr(Ma, Mc)}
+        return {"M_1x2": Ma, "M_gol": Ma, "M_es": Ma, "ancorata": True,
+                "fonte": "ancorata alle quote reali del bookmaker (1X2 + Over/Under 2.5)"}
     Mg = pesi["gol"] * Mb + (1 - pesi["gol"]) * M_freq_live
-    Mc = ricalibra_matrice(Mg, delta["blend"])
     Me = pesi["esatto"] * Mb + (1 - pesi["esatto"]) * M_freq_live
-    return {"M_1x2": Mb, "M_gol": Mc, "M_es": Me, "ancorata": False,
-            "fonte": f"modello + frequenze storiche (peso del modello: {pesi['gol']*100:.0f}% per Goal/Over, {pesi['esatto']*100:.0f}% per i risultati esatti) – nessuna quota disponibile" + testo_corr(Mg, Mc)}
+    return {"M_1x2": Mb, "M_gol": Mg, "M_es": Me, "ancorata": False,
+            "fonte": f"modello + frequenze storiche (peso del modello: {pesi['gol']*100:.0f}% per Goal/Over, {pesi['esatto']*100:.0f}% per i risultati esatti) – nessuna quota disponibile"}
 
 
 def gol_attesi(M):
@@ -2081,12 +2097,19 @@ with tab_backtest:
             st.caption(f"In {n_top_x} partite su {len(bt)} la X era l'esito più probabile secondo il modello. Se 'X reale' è molto più alto di 'X prevista dal modello' "
                        "nelle partite equilibrate, il modello sottostima i pareggi; se è vicino (o vicino a quella del mercato), la X non compare perché non è quasi mai "
                        "l'esito più probabile, non per un errore.")
+        tm = pesi.get("tab_margine")
+        if tm is not None and not tm.empty:
+            st.markdown("#### 🧮 Come togliere il margine dalle quote")
+            st.dataframe(tm, use_container_width=True, hide_index=True)
+            st.caption("Le quote includono il margine del bookmaker: per ricavare probabilità vere ci sono più metodi. 'Proporzionale' sopravvaluta le sfavorite; "
+                       "'potenza' e 'Shin' le correggono. Log loss più basso = probabilità più accurate. L'app passa a un altro metodo solo se migliora in modo chiaro "
+                       "(almeno 1 volta l'errore).")
         st.markdown("#### 📏 Affidabilità storica delle percentuali (usata dall'app)")
         taf = tabella_affidabilita(pesi.get("curve", {}))
         if not taf.empty:
             st.dataframe(taf, use_container_width=True, hide_index=True)
             st.caption("Per ogni mercato e fascia di probabilità mostrata dall'app: quante volte è davvero uscito. Se 'Prevista' e 'Uscita davvero' sono vicine, "
-                       "la percentuale è affidabile in quella fascia. Gli stessi dati su cui l'app ha stimato pesi e correzione: un controllo fuori campione è nel test su stagioni nuove.")
+                       "la percentuale è affidabile in quella fascia. Gli stessi dati su cui l'app ha stimato i pesi: un controllo fuori campione è nel test su stagioni nuove.")
         st.markdown("#### 🎲 Dove la X esce più spesso delle altre")
         tx = tabella_dove_x(bt)
         if not tx.empty:
@@ -2134,8 +2157,7 @@ with tab_backtest:
             st.dataframe(tab_cal, use_container_width=True, hide_index=True)
             st.caption("Differenza = prevista − reale, in punti percentuali. Se per il Goal è NEGATIVA (prevista più bassa della reale), il modello sottostima il Goal "
                        "e sovrastima il No Goal. Le righe 'TUTTE' dicono se c'è uno sbilanciamento medio; le fasce dicono dove. "
-                       "Le righe 'APP … CON correzione' mostrano come cambia con la correzione automatica usata dall'app (stessi dati su cui è stimata: "
-                       "la verifica fuori campione è nel 'Test su stagioni mai viste').")
+                       "La riga 'APP senza quote' è quello che l'app usa quando non ci sono quote; con le quote usa 'Ancorato al mercato'.")
         if not tab_tempi.empty:
             st.markdown("#### 🕐 Primo e secondo tempo: previsto contro reale")
             st.dataframe(tab_tempi, use_container_width=True, hide_index=True)
@@ -2175,8 +2197,7 @@ with tab_backtest:
                    "la scelta automatica dei parametri non sta sovra-adattando. L'ultima stagione è quella in corso, con poche partite.")
         st.markdown("#### 🎯 Goal/No Goal, Over/Under e risultati esatti con pesi scelti sul passato")
         st.dataframe(sn[1], use_container_width=True, hide_index=True)
-        st.caption("Se 'Misto − Frequenze' è negativo e più grande di circa 2 volte l'errore, il misto batte davvero le frequenze fuori campione. "
-                   "'Corretto − Misto' dice se la correzione automatica di Goal e Over, stimata solo sulle stagioni precedenti, migliora davvero (negativo = meglio).")
+        st.caption("Se 'Misto − Frequenze' è negativo e più grande di circa 2 volte l'errore, il misto batte davvero le frequenze fuori campione.")
     elif sn is not None:
         st.warning("Dati insufficienti per questo test: servono almeno 3 stagioni.")
 
