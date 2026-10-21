@@ -109,7 +109,7 @@ API_CODICI = {"I1": "SA", "E0": "PL", "SP1": "PD", "D1": "BL1", "F1": "FL1", "N1
 BASE_URL = "https://football-data.co.uk"
 UA = {"User-Agent": "Mozilla/5.0"}
 N_STAGIONI = 3
-VERSIONE_TEST = 5  # cambia quando cambia la struttura dei risultati del test (invalida la cache)
+VERSIONE_TEST = 6  # cambia quando cambia la struttura dei risultati del test (invalida la cache)
 N_STAGIONI_TEST = 5  # il test usa più stagioni del modello per avere più partite su cui misurare
 W_GRID = (0.0, 0.25, 0.5, 0.75, 1.0)
 FINESTRA_GIORNI = 1000  # finestra di addestramento (circa 3 stagioni), come nell'app live
@@ -529,6 +529,56 @@ def metriche_backtest(bt):
     return out
 
 
+PROB_MIN_DEFAULT = 30  # sotto questa probabilità di mercato le selezioni (sfavorite) rendono molto meno del margine
+
+
+def migliori_per_partita(df, min_prob):
+    """Per ogni partita, la selezione con l'edge più alto tra quelle con probabilità di mercato almeno min_prob."""
+    if df is None or df.empty:
+        return df
+    d = df[df["Prob_Mercato"] >= min_prob]
+    if d.empty:
+        return d
+    return d.loc[d.groupby("Partita")["Edge"].idxmax()].sort_values("Edge", ascending=False)
+
+
+def tabella_scommesse_fasce(bt, soglia_edge=3.0, prob_min=PROB_MIN_DEFAULT):
+    """Scommesse simulate (esito con edge più alto) divise per probabilità di mercato dell'esito scelto, e con il filtro dell'app."""
+    ok = bt[["q1", "qx", "q2"]].notna().all(axis=1) & bt[["m1", "mx", "m2"]].notna().all(axis=1)
+    b = bt[ok]
+    if len(b) < 50:
+        return pd.DataFrame()
+    P, Q, M = b[["p1", "px", "p2"]].to_numpy(), b[["q1", "qx", "q2"]].to_numpy(), b[["m1", "mx", "m2"]].to_numpy()
+    y = b["y"].to_numpy(int)
+    PF = np.array([senza_margine(q_) for q_ in Q])
+    edge = P * Q - 1
+    n = len(b)
+    righe = []
+
+    def riga(nome, sel, k):
+        if sel.sum() < 5:
+            return
+        idx = np.where(sel)[0]
+        kk = k[idx]
+        qk = Q[idx, kk]
+        pr = np.where(y[idx] == kk, qk - 1, -1.0)
+        clv = qk * M[idx, kk] - 1
+        righe.append({"Gruppo": nome, "Scommesse": int(len(idx)), "Vinte %": round(float((y[idx] == kk).mean() * 100), 1),
+                      "ROI %": round(float(pr.mean() * 100), 1), "± ROI %": round(float(pr.std(ddof=1) / math.sqrt(len(idx)) * 100), 1),
+                      "CLV medio %": round(float(clv.mean() * 100), 1)})
+    k0 = edge.argmax(axis=1)
+    e0 = edge[np.arange(n), k0]
+    pf0 = PF[np.arange(n), k0]
+    base = e0 >= soglia_edge / 100
+    for nome, lo, hi in [("Esito con prob. di mercato fino a 25%", 0, 0.25), ("25-35%", 0.25, 0.35), ("35-45%", 0.35, 0.45), ("oltre 45%", 0.45, 1.01)]:
+        riga(nome, base & (pf0 >= lo) & (pf0 < hi), k0)
+    edge_f = np.where(PF >= prob_min / 100, edge, -np.inf)
+    k1 = edge_f.argmax(axis=1)
+    e1 = edge_f[np.arange(n), k1]
+    riga(f"CON IL FILTRO DELL'APP (prob. di mercato ≥ {prob_min}%)", np.isfinite(e1) & (e1 >= soglia_edge / 100), k1)
+    return pd.DataFrame(righe)
+
+
 def tabella_scommesse(bt, soglie=(0, 2, 5, 8, 10)):
     ok = bt[["q1", "qx", "q2"]].notna().all(axis=1)
     b = bt[ok]
@@ -668,7 +718,7 @@ def esegui_test_completo(df, ridge, halflife, passo, solo_base=False, inizio=Non
     t = inizio if inizio is not None else df.loc[df["Stag"] == stagioni[1], "Date"].min()
     fine = df["Date"].max()
     nan_m = np.full((11, 11), np.nan)
-    rec = {"Partita": [], "xs": [], "ys": [], "ok": [], "ou_ok": [], "m1x2": [], "mou": [], "min_storia": [], "tiri_ok": [], "date": [], "q": [], "ht": [], "pi": []}
+    rec = {"Partita": [], "xs": [], "ys": [], "ok": [], "ou_ok": [], "m1x2": [], "mou": [], "min_storia": [], "tiri_ok": [], "date": [], "q": [], "ht": [], "split": []}
     Ms = {v: [] for v in VARIANTI}
     ha_tiri = {"HST", "AST"}.issubset(df.columns)
     while t <= fine:
@@ -678,9 +728,9 @@ def esegui_test_completo(df, ridge, halflife, passo, solo_base=False, inizio=Non
             m = adatta_modello(train, t, ridge, halflife, True)
             cnt = pd.concat([train["HomeTeam"], train["AwayTeam"]]).value_counts()
             m_freq = matrice_frequenze(train)
-            pih, pia = quota_primo_tempo(train)
+            S_blocco = tabella_split(train)
             m_t, conv = None, None
-            if ha_tiri and not solo_base and not leggero:
+            if ha_tiri and not solo_base:
                 tr_t = train.dropna(subset=["HST", "AST"])
                 if len(tr_t) >= 150 and tr_t["HST"].sum() > 0 and tr_t["AST"].sum() > 0:
                     d_t = tr_t.copy()
@@ -719,7 +769,7 @@ def esegui_test_completo(df, ridge, halflife, passo, solo_base=False, inizio=Non
                 rec["xs"].append(min(int(r["FTHG"]), 10))
                 rec["ys"].append(min(int(r["FTAG"]), 10))
                 rec["q"].append(np.array(qp, float) if qp else np.full(3, np.nan))
-                rec["pi"].append((pih, pia))
+                rec["split"].append(S_blocco)
                 rec["ht"].append((float(r["HTHG"]), float(r["HTAG"])) if ("HTHG" in r.index and pd.notna(r["HTHG"]) and pd.notna(r["HTAG"])) else (np.nan, np.nan))
                 rec["ok"].append(bool(qp))
                 rec["ou_ok"].append(bool(qp and qoc))
@@ -776,18 +826,18 @@ def _diff_se(a, b):
     return f"{d.mean():+.4f} ± {se:.4f}"
 
 
-def pesi_ottimi(res):
+def pesi_ottimi(res, nome_gol="Modello", nome_es="Modello"):
     """Peso del modello (resto: frequenze storiche) che minimizza l'errore: uno per i mercati gol, uno per i risultati esatti."""
     xs, ys = res["xs"], res["ys"]
     esito = np.where(xs > ys, 0, np.where(xs == ys, 1, 2))
     outc = {"over1.5": (xs + ys > 1.5).astype(float), "over2.5": (xs + ys > 2.5).astype(float),
             "over3.5": (xs + ys > 3.5).astype(float), "btts": ((xs > 0) & (ys > 0)).astype(float)}
-    Mb, Mf = res["Ms"]["Modello"], res["Ms"]["Frequenze storiche"]
+    Mb_g, Mb_e, Mf = res["Ms"][nome_gol], res["Ms"][nome_es], res["Ms"]["Frequenze storiche"]
     gol, esatto = {}, {}
     for w in W_GRID:
-        Mw = w * Mb + (1 - w) * Mf
+        Mw = w * Mb_g + (1 - w) * Mf
         gol[w] = float(np.mean([_vettore_perdita(Mw, k_, xs, ys, outc, esito).mean() for k_ in ("over1.5", "over2.5", "over3.5", "btts")]))
-        esatto[w] = float(_vettore_perdita(Mw, "exact", xs, ys, outc, esito).mean())
+        esatto[w] = float(_vettore_perdita(w * Mb_e + (1 - w) * Mf, "exact", xs, ys, outc, esito).mean())
     return {"gol": min(gol, key=gol.get), "esatto": min(esatto, key=esatto.get), "n": len(xs)}
 
 
@@ -816,9 +866,17 @@ def tabella_roi(res, ok_mask, esito):
     return pd.DataFrame(righe)
 
 
+def _base_app(res, pesi, chiave):
+    """Matrici del modello come le usa l'app senza quote (con i tiri in porta dove il backtest li ha giustificati)."""
+    usa = bool(pesi and pesi.get(chiave) and "tiri_ok" in res and res["tiri_ok"].mean() >= 0.5)
+    if usa:
+        return np.where(res["tiri_ok"][:, None, None], res["Ms"]["Gol + Tiri 50/50"], res["Ms"]["Modello"])
+    return res["Ms"]["Modello"]
+
+
 def tabella_tempi_test(res, ok_mask, pesi=None):
     """Primo e secondo tempo: probabilità previste contro frequenze reali (media), per le due fonti dell'app."""
-    if "ht" not in res or "pi" not in res:
+    if "ht" not in res or "split" not in res:
         return pd.DataFrame()
     ht = res["ht"]
     ha_ht = ~np.isnan(ht).any(axis=1)
@@ -827,7 +885,7 @@ def tabella_tempi_test(res, ok_mask, pesi=None):
     xs, ys = res["xs"], res["ys"]
     h1 = ht[:, 0] + ht[:, 1]
     h2 = (xs - ht[:, 0]) + (ys - ht[:, 1])
-    Mb, Mf, Ma = res["Ms"]["Modello"], res["Ms"]["Frequenze storiche"], res["Ms"]["Ancorato al mercato"]
+    Mb, Mf, Ma = _base_app(res, pesi, "tiri_gol"), res["Ms"]["Frequenze storiche"], res["Ms"]["Ancorato al mercato"]
     w = pesi["gol"] if pesi else 0.5
     mercati_t = [("1° tempo almeno 1 gol", lambda p1, p2, pm: 1 - p1[0], lambda a, b: a >= 1),
                  ("1° tempo almeno 2 gol", lambda p1, p2, pm: 1 - p1[0] - p1[1], lambda a, b: a >= 2),
@@ -846,8 +904,7 @@ def tabella_tempi_test(res, ok_mask, pesi=None):
             continue
         pred = {m[0]: [] for m in mercati_t}
         for i in idx:
-            p1, p2 = probs_tempi(costruisci(i), res["pi"][i][0], res["pi"][i][1])
-            pm = np.outer(p1, p2)
+            p1, p2, pm = probs_tempi(costruisci(i), res["split"][i])
             for nome, fp, _ in mercati_t:
                 pred[nome].append(float(fp(p1, p2, pm)))
         for nome, _, fa in mercati_t:
@@ -986,7 +1043,8 @@ def tabelle_test(res, pesi=None):
                  "Ancorato al mercato": res["Ms"]["Ancorato al mercato"][sel_c]}
         if pesi is not None:
             w_l = pesi["gol"]
-            fonti[f"APP senza quote (peso modello {int(w_l * 100)}%)"] = w_l * Mb_c + (1 - w_l) * Mf_c
+            Mb_app = _base_app(res, pesi, "tiri_gol")[sel_c]
+            fonti[f"APP senza quote (peso modello {int(w_l * 100)}%)"] = w_l * Mb_app + (1 - w_l) * Mf_c
         o_c = outc[mk][sel_c]
         for nome_f, Mv in fonti.items():
             pm = _p_mercato(Mv, mk)
@@ -1025,11 +1083,11 @@ def _campioni(M1x2, Mgol, esito, outc):
             "ou": (np.concatenate(pred_ou), np.concatenate(hit_ou))}
 
 
-def costruisci_curve(res, w_gol):
+def costruisci_curve(res, w_gol, nome_gol="Modello"):
     """Affidabilità storica delle percentuali nelle due situazioni dell'app: senza quote e con quote."""
     esito, outc = _esiti(res["xs"], res["ys"])
     Mb, Mf, Ma = res["Ms"]["Modello"], res["Ms"]["Frequenze storiche"], res["Ms"]["Ancorato al mercato"]
-    Mw = w_gol * Mb + (1 - w_gol) * Mf
+    Mw = w_gol * res["Ms"][nome_gol] + (1 - w_gol) * Mf
     out = {"senza": _campioni(Mb, Mw, esito, outc)}
     sel = res["ou_ok"]
     if sel.sum() >= 100:
@@ -1065,6 +1123,45 @@ def tabella_affidabilita(curve):
     return pd.DataFrame(righe)
 
 
+def decidi_tiri(res):
+    """I tiri in porta migliorano il modello in questo campionato? Si usano solo se, sul backtest, il miglioramento supera 1.5 volte l'errore."""
+    out = {"gol": False, "esatto": False, "tab": pd.DataFrame()}
+    if "tiri_ok" not in res or res["tiri_ok"].sum() < 300:
+        return out
+    sel = res["tiri_ok"]
+    xs, ys = res["xs"][sel], res["ys"][sel]
+    esito, outc = _esiti(xs, ys)
+    Mm, Mt = res["Ms"]["Modello"][sel], res["Ms"]["Gol + Tiri 50/50"][sel]
+    d_gol = np.mean([_vettore_perdita(Mt, k_, xs, ys, outc, esito) - _vettore_perdita(Mm, k_, xs, ys, outc, esito)
+                     for k_ in ("over1.5", "over2.5", "over3.5", "btts")], axis=0)
+    d_es = _vettore_perdita(Mt, "exact", xs, ys, outc, esito) - _vettore_perdita(Mm, "exact", xs, ys, outc, esito)
+    righe = []
+    for nome, d_, chiave in (("Goal, Over/Under (media dei 4 mercati)", d_gol, "gol"), ("Risultato esatto", d_es, "esatto")):
+        se = float(d_.std(ddof=1) / math.sqrt(len(d_)))
+        out[chiave] = bool(d_.mean() < 0 and -d_.mean() >= 1.5 * se)
+        righe.append({"Mercato": nome, "Partite": int(len(d_)), "Gol+Tiri − Modello (± err.)": f"{d_.mean():+.4f} ± {se:.4f}",
+                      "Usato dall'app": "sì" if out[chiave] else "no"})
+    out["tab"] = pd.DataFrame(righe)
+    return out
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def modello_tiri_corrente(div, ridge, halflife, giorno):
+    """Modello degli attacchi/difese stimato sui tiri in porta, per le previsioni dal vivo (se i tiri sono disponibili)."""
+    df = carica_storico(div, N_STAGIONI, giorno)
+    if df is None or not {"HST", "AST"}.issubset(df.columns):
+        return None
+    tr_t = df.dropna(subset=["HST", "AST"])
+    if len(tr_t) < 150 or tr_t["HST"].sum() <= 0 or tr_t["AST"].sum() <= 0:
+        return None
+    d_t = tr_t.copy()
+    d_t["FTHG"], d_t["FTAG"] = tr_t["HST"].astype(int), tr_t["AST"].astype(int)
+    scala = (tr_t["HST"] + tr_t["AST"]).mean() / max((tr_t["FTHG"] + tr_t["FTAG"]).mean(), 1e-9)
+    m_t = adatta_modello(d_t, pd.Timestamp.now().normalize(), ridge * scala, halflife, False)
+    conv = (tr_t["FTHG"].sum() / tr_t["HST"].sum(), tr_t["FTAG"].sum() / tr_t["AST"].sum())
+    return {"modello": m_t, "conv": conv}
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner="Calcolo pesi e affidabilità dal backtest (solo la prima volta di giornata)...")
 def pesi_blend_auto(div, ridge, halflife, giorno):
     """Dal backtest: metodo per togliere il margine dalle quote, peso del modello senza quote (resto: frequenze storiche),
@@ -1075,9 +1172,16 @@ def pesi_blend_auto(div, ridge, halflife, giorno):
     res = esegui_test_completo(df, ridge, halflife, 28, leggero=True) if df is not None else None
     if res is None or len(res["xs"]) < 100:
         return {"gol": 0.5, "esatto": 0.75, "n": 0, "auto": False, "soglia_x": {"modello": None, "ancorato": None}, "curve": {},
-                "metodo_margine": metodo, "tab_margine": tab_margine}
-    w = pesi_ottimi(res)
+                "metodo_margine": metodo, "tab_margine": tab_margine, "tiri_gol": False, "tiri_esatto": False, "tab_tiri": pd.DataFrame(),
+                "nome_gol": "Modello", "nome_esatto": "Modello"}
+    dt = decidi_tiri(res)
+    res["Ms"]["Modello+Tiri"] = np.where(res["tiri_ok"][:, None, None], res["Ms"]["Gol + Tiri 50/50"], res["Ms"]["Modello"])
+    nome_g = "Modello+Tiri" if dt["gol"] else "Modello"
+    nome_e = "Modello+Tiri" if dt["esatto"] else "Modello"
+    w = pesi_ottimi(res, nome_g, nome_e)
     w["auto"] = True
+    w["tiri_gol"], w["tiri_esatto"], w["tab_tiri"] = dt["gol"], dt["esatto"], dt["tab"]
+    w["nome_gol"], w["nome_esatto"] = nome_g, nome_e
     w["metodo_margine"], w["tab_margine"] = metodo, tab_margine
     es_, _ = _esiti(res["xs"], res["ys"])
     P_mod = np.stack([_p_mercato(res["Ms"]["Modello"], k_) for k_ in ("p1", "px", "p2")], axis=1)
@@ -1086,7 +1190,7 @@ def pesi_blend_auto(div, ridge, halflife, giorno):
         P_anc = np.stack([_p_mercato(res["Ms"]["Ancorato al mercato"][res["ok"]], k_) for k_ in ("p1", "px", "p2")], axis=1)
         sx["ancorato"] = trova_soglia_x(P_anc, es_[res["ok"]])
     w["soglia_x"] = sx
-    w["curve"] = costruisci_curve(res, w["gol"])
+    w["curve"] = costruisci_curve(res, w["gol"], nome_g)
     return w
 
 
@@ -1467,17 +1571,45 @@ def quota_primo_tempo(df):
     return (float(min(max(d["HTHG"].sum() / d["FTHG"].sum(), 0.2), 0.7)), float(min(max(d["HTAG"].sum() / d["FTAG"].sum(), 0.2), 0.7)))
 
 
-def probs_tempi(M_gol, pi_h, pi_a):
-    """Distribuzione dei gol del 1° e 2° tempo: la quota di gol per tempo viene dallo storico, gli attesi dalla distribuzione della partita."""
-    k = np.arange(M_gol.shape[0])
-    eh, ea = float((M_gol.sum(axis=1) * k).sum()), float((M_gol.sum(axis=0) * k).sum())
-    p1 = _pmf(max(eh * pi_h + ea * pi_a, 1e-6))
-    p2 = _pmf(max(eh * (1 - pi_h) + ea * (1 - pi_a), 1e-6))
-    return p1 / p1.sum(), p2 / p2.sum()
+def tabella_split(df, s=10.0):
+    """Come si dividono davvero i gol tra 1° e 2° tempo, dato il totale della partita (frequenze storiche, lisciate verso la divisione binomiale).
+    S[t][k] = probabilità che in una partita con t gol ne siano stati segnati k nel 1° tempo."""
+    S = np.zeros((11, 11))
+    pi = 0.45
+    d = None
+    if {"HTHG", "HTAG"}.issubset(df.columns):
+        d = df.dropna(subset=["HTHG", "HTAG"])
+        if len(d) < 100:
+            d = None
+    if d is not None:
+        ft = (d["FTHG"] + d["FTAG"]).to_numpy(int)
+        h1 = (d["HTHG"] + d["HTAG"]).to_numpy(int)
+        pi = float(min(max(h1.sum() / max(ft.sum(), 1), 0.3), 0.6))
+    for t in range(11):
+        prior = np.array([math.comb(t, k) * pi ** k * (1 - pi) ** (t - k) for k in range(t + 1)])
+        if d is None:
+            S[t, :t + 1] = prior
+            continue
+        m = ft == t
+        counts = np.bincount(np.clip(h1[m], 0, t), minlength=t + 1)[:t + 1].astype(float)
+        S[t, :t + 1] = (counts + s * prior) / (m.sum() + s)
+    return S
 
 
-def tabelle_tempi(M_gol, pi_h, pi_a, freq=None):
-    p1, p2 = probs_tempi(M_gol, pi_h, pi_a)
+def probs_tempi(M_gol, S):
+    """Distribuzione dei gol del 1° e 2° tempo: il totale della partita viene da M_gol, la divisione tra i tempi dallo storico."""
+    tot = np.add.outer(np.arange(M_gol.shape[0]), np.arange(M_gol.shape[1]))
+    pt = np.array([M_gol[tot == t].sum() for t in range(11)])
+    pt = pt / pt.sum()
+    joint = np.zeros((11, 11))
+    for t in range(11):
+        for k in range(t + 1):
+            joint[k, t - k] += pt[t] * S[t, k]
+    return joint.sum(axis=1), joint.sum(axis=0), joint
+
+
+def tabelle_tempi(M_gol, S, freq=None):
+    p1, p2, pm = probs_tempi(M_gol, S)
     out = {}
 
     def righe(p, nome):
@@ -1486,7 +1618,6 @@ def tabelle_tempi(M_gol, pi_h, pi_a, freq=None):
         rows.append(_riga_prob(f"{nome} almeno 2 gol", 1 - p[0] - p[1], freq))
         return pd.DataFrame(rows)
     out["t1"], out["t2"] = righe(p1, "1° tempo"), righe(p2, "2° tempo")
-    pm = np.outer(p1, p2)
     out["piu_gol"] = pd.DataFrame([_riga_prob("Primo tempo più gol", np.tril(pm, -1).sum(), freq),
                                    _riga_prob("Gol uguali nei due tempi", np.trace(pm), freq),
                                    _riga_prob("Secondo tempo più gol", np.triu(pm, 1).sum(), freq)])
@@ -1629,9 +1760,11 @@ calendario, fonte_cal = costruisci_calendario(div, df_storico, fx, chiave_api, m
 # Quote del prossimo turno (1X2 + Over/Under 2.5 senza margine) e distribuzione dei punteggi "migliore disponibile"
 pesi = pesi_blend_auto(div, par["ridge"], par["halflife"], giorno)
 METODO_MARGINE["m"] = pesi.get("metodo_margine", "proporzionale")
+modello_tiri = modello_tiri_corrente(div, par["ridge"], par["halflife"], giorno) if (pesi.get("tiri_gol") or pesi.get("tiri_esatto")) else None
 M_freq_live = matrice_frequenze(df_storico)
 freq_combo = frequenze_combo(df_storico)
 quota_pt = quota_primo_tempo(df_storico)
+split_live = tabella_split(df_storico)
 quote_fixtures = {}
 if fx is not None:
     for _, _r in fx.iterrows():
@@ -1650,10 +1783,18 @@ def distribuzione(casa, trasf):
         Ma = matrice_ancorata(q[0], q[1], modello["rho"], (lh, la))
         return {"M_1x2": Ma, "M_gol": Ma, "M_es": Ma, "ancorata": True,
                 "fonte": "ancorata alle quote reali del bookmaker (1X2 + Over/Under 2.5)"}
-    Mg = pesi["gol"] * Mb + (1 - pesi["gol"]) * M_freq_live
-    Me = pesi["esatto"] * Mb + (1 - pesi["esatto"]) * M_freq_live
+    Mt = Mb
+    if modello_tiri is not None and (pesi.get("tiri_gol") or pesi.get("tiri_esatto")):
+        lth, lta = lambda_partita(modello_tiri["modello"], casa, trasf)
+        Mt = matrice_punteggi(math.sqrt(lh * lth * modello_tiri["conv"][0]), math.sqrt(la * lta * modello_tiri["conv"][1]), modello["rho"])
+    Mb_g = Mt if (modello_tiri is not None and pesi.get("tiri_gol")) else Mb
+    Mb_e = Mt if (modello_tiri is not None and pesi.get("tiri_esatto")) else Mb
+    Mg = pesi["gol"] * Mb_g + (1 - pesi["gol"]) * M_freq_live
+    Me = pesi["esatto"] * Mb_e + (1 - pesi["esatto"]) * M_freq_live
+    usa_t = [n_ for n_, f_ in (("Goal/Over", pesi.get("tiri_gol")), ("risultati esatti", pesi.get("tiri_esatto"))) if f_ and modello_tiri is not None]
     return {"M_1x2": Mb, "M_gol": Mg, "M_es": Me, "ancorata": False,
-            "fonte": f"modello + frequenze storiche (peso del modello: {pesi['gol']*100:.0f}% per Goal/Over, {pesi['esatto']*100:.0f}% per i risultati esatti) – nessuna quota disponibile"}
+            "fonte": f"modello + frequenze storiche (peso del modello: {pesi['gol']*100:.0f}% per Goal/Over, {pesi['esatto']*100:.0f}% per i risultati esatti)"
+                     + (f", con i tiri in porta per {' e '.join(usa_t)}" if usa_t else "") + " – nessuna quota disponibile"}
 
 
 def gol_attesi(M):
@@ -1674,16 +1815,16 @@ if fx is not None:
         P = np.array([mk["p1"], mk["px"], mk["p2"]])
         pm = senza_margine(q)
         nomi = [f"1 ({casa})", "X (Pareggio)", f"2 ({trasf})"]
-        k = int(np.argmax(P * np.array(q)))
-        righe_val.append({
-            "Data": r["Date"].strftime("%d/%m") if "Date" in r and pd.notna(r["Date"]) else "",
-            "Partita": f"{casa} vs {trasf}", "Selezione": nomi[k],
-            "P1 %": round(P[0] * 100, 1), "PX %": round(P[1] * 100, 1), "P2 %": round(P[2] * 100, 1),
-            "Prob_Modello": round(P[k] * 100, 1), "Prob_Mercato": round(pm[k] * 100, 1),
-            "Quota_Book": round(q[k], 2), "Edge": round((P[k] * q[k] - 1) * 100, 1),
-            "Nota": "⚠ senza storico" if (casa not in modello["idx"] or trasf not in modello["idx"]) else "",
-        })
-df_value = pd.DataFrame(righe_val).sort_values("Edge", ascending=False) if righe_val else pd.DataFrame()
+        for k in range(3):
+            righe_val.append({
+                "Data": r["Date"].strftime("%d/%m") if "Date" in r and pd.notna(r["Date"]) else "",
+                "Partita": f"{casa} vs {trasf}", "Selezione": nomi[k],
+                "P1 %": round(P[0] * 100, 1), "PX %": round(P[1] * 100, 1), "P2 %": round(P[2] * 100, 1),
+                "Prob_Modello": round(P[k] * 100, 1), "Prob_Mercato": round(pm[k] * 100, 1),
+                "Quota_Book": round(q[k], 2), "Edge": round((P[k] * q[k] - 1) * 100, 1),
+                "Nota": "⚠ senza storico" if (casa not in modello["idx"] or trasf not in modello["idx"]) else "",
+            })
+df_value = pd.DataFrame(righe_val)  # tutte le selezioni (3 per partita)
 
 tab_calendario, tab_pronostici, tab_classifica, tab_value_finder, tab_ai_schedine, tab_monte_carlo, tab_backtest, tab_kelly = st.tabs([
     "📅 Calendario", "📋 Pronostici", "🏆 Classifica", "⚡ Value Finder", "🤖 Schedine AI", "🎲 Monte Carlo", "🧪 Backtest", "🧮 Value Bet",
@@ -1742,7 +1883,7 @@ def mostra_analisi(casa, trasf, data, ora):
                    "non hanno battuto in modo netto le semplici frequenze storiche. Considerali indicativi, vicini alla media del campionato.")
     soglia_x = pesi.get("soglia_x", {}).get("ancorato" if d["ancorata"] else "modello")
     pr = tabelle_pronostico(d["M_1x2"], d["M_gol"], freq_combo, soglia_x)
-    pt = tabelle_tempi(d["M_gol"], quota_pt[0], quota_pt[1], freq_combo)
+    pt = tabelle_tempi(d["M_gol"], split_live, freq_combo)
     ps = tabelle_squadre(d["M_gol"], freq_combo)
     pp = pr["p"]
     st.markdown("#### 🎯 Il pronostico")
@@ -1847,8 +1988,8 @@ def mostra_analisi(casa, trasf, data, ora):
     st.markdown("**Quale tempo ha più gol**")
     st.dataframe(pt["piu_gol"], use_container_width=True, hide_index=True)
     st.caption(f"Combo, multigol e tempi sono calcolati dalla stessa distribuzione dei punteggi (1X2 come mostrato sopra, gol secondo la fonte indicata). "
-               f"I tempi usano la quota di gol del 1° tempo del campionato ({quota_pt[0]*100:.0f}% in casa, {quota_pt[1]*100:.0f}% in trasferta) con gol indipendenti nei due tempi: "
-               "è un'approssimazione, verificata nel Backtest. Un multigol più largo è sempre più probabile ma paga meno: confronta la quota equa con quella offerta.")
+               f"I tempi usano il totale dei gol della partita e come i gol si sono divisi davvero tra primo e secondo tempo nello storico del campionato "
+               f"(circa il {quota_pt[0]*100:.0f}% dei gol in casa e il {quota_pt[1]*100:.0f}% in trasferta arriva nel 1° tempo): è un'approssimazione, verificata nel Backtest. Un multigol più largo è sempre più probabile ma paga meno: confronta la quota equa con quella offerta.")
     if d["ancorata"]:
         st.caption("Con le quote reali le probabilità 1X2 coincidono con quelle del mercato (senza margine): non c'è edge da cercare qui.")
     if casa not in modello["idx"] or trasf not in modello["idx"]:
@@ -1975,6 +2116,9 @@ with tab_value_finder:
                    "l'edge sarebbe sempre negativo (il margine del bookmaker). Un edge alto di solito è un errore del modello: "
                    "controlla nel tab Backtest da quale soglia l'edge ha avuto CLV positivo.")
         min_edge = st.slider("Edge Minimo (%)", 0.0, 25.0, 3.0)
+        min_prob = st.slider("Probabilità di mercato minima della selezione (%)", 0, 60, PROB_MIN_DEFAULT)
+        st.caption("Le sfavorite (probabilità di mercato bassa) nei backtest perdono molto più del margine: in tre campionati le vittorie in casa sotto il 25% "
+                   "hanno reso circa −35%. Per questo di default non le mostro: abbassa il filtro solo se sai cosa fai.")
         bt_b = backtest_cached(div, par["ridge"], par["halflife"], 14, giorno)
         if bt_b is not None and not bt_b.empty:
             n_b, clv_m, clv_se = riassunto_clv(bt_b, min_edge)
@@ -1989,14 +2133,19 @@ with tab_value_finder:
             else:
                 st.info(f"Backtest: CLV medio {clv_m:+.1f}% (± {clv_se:.1f}) su {n_b} scommesse con edge ≥ {min_edge:.0f}%: "
                         "non distinguibile da zero, quindi nessun vantaggio dimostrato.")
-        st.dataframe(df_value[df_value["Edge"] >= min_edge], use_container_width=True, hide_index=True)
+        vis_ = migliori_per_partita(df_value, min_prob)
+        vis_ = vis_[vis_["Edge"] >= min_edge] if not vis_.empty else vis_
+        if vis_.empty:
+            st.info("Nessuna selezione con questi filtri.")
+        else:
+            st.dataframe(vis_, use_container_width=True, hide_index=True)
         if (df_value["Nota"] != "").any():
             st.caption("⚠ Squadre senza storico (es. neopromosse) sono trattate come squadra media: probabilmente sopravvalutate.")
 
 # --- SCHEDINE AI ---
 with tab_ai_schedine:
     st.subheader("🤖 Schedine Smart & Combo AI")
-    base = df_value[df_value["Nota"] == ""] if not df_value.empty else df_value
+    base = migliori_per_partita(df_value[df_value["Nota"] == ""], PROB_MIN_DEFAULT) if not df_value.empty else df_value
     if base.empty or len(base) < 2:
         st.info("Servono almeno 2 partite del prossimo turno con quote reali e squadre con storico.")
     else:
@@ -2088,6 +2237,11 @@ with tab_backtest:
             st.info("Quote non disponibili per simulare le scommesse.")
         else:
             st.dataframe(tb, use_container_width=True, hide_index=True)
+            tf_ = tabella_scommesse_fasce(bt)
+            if not tf_.empty:
+                st.markdown("**Le stesse scommesse (edge ≥ 3%) divise per probabilità di mercato dell'esito scelto**")
+                st.dataframe(tf_, use_container_width=True, hide_index=True)
+                st.caption("Se le fasce basse perdono molto più delle alte, il filtro dell'app (ultima riga) migliora il rendimento. Il ROI resta rumoroso: guarda l'errore.")
             st.caption("Il ROI su poche centinaia di scommesse è molto rumoroso: guarda l'errore (± ROI) e il CLV. "
                        "Un CLV medio positivo e stabile è un segnale più affidabile del ROI.")
         st.markdown("#### 🎲 Il pareggio (X): il modello lo sottostima?")
@@ -2097,6 +2251,12 @@ with tab_backtest:
             st.caption(f"In {n_top_x} partite su {len(bt)} la X era l'esito più probabile secondo il modello. Se 'X reale' è molto più alto di 'X prevista dal modello' "
                        "nelle partite equilibrate, il modello sottostima i pareggi; se è vicino (o vicino a quella del mercato), la X non compare perché non è quasi mai "
                        "l'esito più probabile, non per un errore.")
+        tt_ = pesi.get("tab_tiri")
+        if tt_ is not None and not tt_.empty:
+            st.markdown("#### 🎯 Tiri in porta: l'app li usa in questo campionato?")
+            st.dataframe(tt_, use_container_width=True, hide_index=True)
+            st.caption("Valori negativi = i tiri in porta migliorano il modello. L'app li usa per Goal/Over-Under e risultati esatti (senza quote) solo dove il miglioramento "
+                       "supera 1.5 volte l'errore; per l'1X2 non li usa mai.")
         tm = pesi.get("tab_margine")
         if tm is not None and not tm.empty:
             st.markdown("#### 🧮 Come togliere il margine dalle quote")
@@ -2143,7 +2303,7 @@ with tab_backtest:
             st.session_state["tc"] = test_completo_cached(div, par["ridge"], par["halflife"], 14, giorno, VERSIONE_TEST)
             st.session_state["tc_div"] = div
     tc = st.session_state.get("tc") if st.session_state.get("tc_div") == div else None
-    if tc is not None and ("tiri_ok" not in tc or "q" not in tc or "pi" not in tc):
+    if tc is not None and ("tiri_ok" not in tc or "q" not in tc or "split" not in tc):
         tc = None  # risultato vecchio rimasto nella sessione: rilancia il test
     if tc is not None:
         tab_a, tab_b, tab_c, tab_d, tab_e, best_ex, tab_cal, tab_roi, tab_tempi = tabelle_test(tc, pesi)
@@ -2161,7 +2321,7 @@ with tab_backtest:
         if not tab_tempi.empty:
             st.markdown("#### 🕐 Primo e secondo tempo: previsto contro reale")
             st.dataframe(tab_tempi, use_container_width=True, hide_index=True)
-            st.caption("Verifica del modello dei tempi (quota di gol del 1° tempo dallo storico, gol indipendenti nei due tempi). "
+            st.caption("Verifica del modello dei tempi (totale dei gol della partita + divisione tra i tempi dallo storico). "
                        "Differenza = prevista − reale in punti: vicino a 0 va bene; se è grande, i tempi vanno corretti.")
         if not tab_roi.empty:
             st.markdown("#### 💶 Rendimento per esito e probabilità di mercato (puntando sempre quell'esito)")
