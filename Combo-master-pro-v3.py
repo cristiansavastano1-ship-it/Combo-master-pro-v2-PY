@@ -728,7 +728,7 @@ def esegui_test_completo(df, ridge, halflife, passo, solo_base=False, inizio=Non
             m = adatta_modello(train, t, ridge, halflife, True)
             cnt = pd.concat([train["HomeTeam"], train["AwayTeam"]]).value_counts()
             m_freq = matrice_frequenze(train)
-            S_blocco = tabella_split(train)
+            S_blocco = tabella_split(train, data_rif=t, halflife=halflife)
             m_t, conv = None, None
             if ha_tiri and not solo_base:
                 tr_t = train.dropna(subset=["HST", "AST"])
@@ -1571,9 +1571,10 @@ def quota_primo_tempo(df):
     return (float(min(max(d["HTHG"].sum() / d["FTHG"].sum(), 0.2), 0.7)), float(min(max(d["HTAG"].sum() / d["FTAG"].sum(), 0.2), 0.7)))
 
 
-def tabella_split(df, s=10.0):
+def tabella_split(df, s=10.0, data_rif=None, halflife=None):
     """Come si dividono davvero i gol tra 1° e 2° tempo, dato il totale della partita (frequenze storiche, lisciate verso la divisione binomiale).
-    S[t][k] = probabilità che in una partita con t gol ne siano stati segnati k nel 1° tempo."""
+    S[t][k] = probabilità che in una partita con t gol ne siano stati segnati k nel 1° tempo.
+    Se data_rif e halflife sono dati, le partite pesano 0.5^(età/halflife) (come nel modello principale); altrimenti pesano tutte 1."""
     S = np.zeros((11, 11))
     pi = 0.45
     d = None
@@ -1584,15 +1585,20 @@ def tabella_split(df, s=10.0):
     if d is not None:
         ft = (d["FTHG"] + d["FTAG"]).to_numpy(int)
         h1 = (d["HTHG"] + d["HTAG"]).to_numpy(int)
-        pi = float(min(max(h1.sum() / max(ft.sum(), 1), 0.3), 0.6))
+        if data_rif is not None and halflife and halflife > 0:
+            eta_gg = (data_rif - d["Date"]).dt.days.clip(lower=0).to_numpy(float)
+            w = np.exp(-np.log(2) * eta_gg / halflife)
+        else:
+            w = np.ones(len(d))
+        pi = float(min(max((w * h1).sum() / max((w * ft).sum(), 1), 0.3), 0.6))
     for t in range(11):
         prior = np.array([math.comb(t, k) * pi ** k * (1 - pi) ** (t - k) for k in range(t + 1)])
         if d is None:
             S[t, :t + 1] = prior
             continue
         m = ft == t
-        counts = np.bincount(np.clip(h1[m], 0, t), minlength=t + 1)[:t + 1].astype(float)
-        S[t, :t + 1] = (counts + s * prior) / (m.sum() + s)
+        counts = np.bincount(np.clip(h1[m], 0, t), weights=w[m], minlength=t + 1)[:t + 1].astype(float)
+        S[t, :t + 1] = (counts + s * prior) / (w[m].sum() + s)
     return S
 
 
@@ -1764,7 +1770,7 @@ modello_tiri = modello_tiri_corrente(div, par["ridge"], par["halflife"], giorno)
 M_freq_live = matrice_frequenze(df_storico)
 freq_combo = frequenze_combo(df_storico)
 quota_pt = quota_primo_tempo(df_storico)
-split_live = tabella_split(df_storico)
+split_live = tabella_split(df_storico, data_rif=oggi_ts, halflife=par["halflife"])
 quote_fixtures = {}
 if fx is not None:
     for _, _r in fx.iterrows():
