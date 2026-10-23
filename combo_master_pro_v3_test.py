@@ -110,6 +110,7 @@ BASE_URL = "https://football-data.co.uk"
 UA = {"User-Agent": "Mozilla/5.0"}
 N_STAGIONI = 3
 VERSIONE_TEST = 6  # cambia quando cambia la struttura dei risultati del test (invalida la cache)
+HALFLIFE_SPLIT = 365  # emivita fissa (giorni) per la ripartizione dei gol tra i tempi, indipendente da quella del modello (esperimento)
 N_STAGIONI_TEST = 5  # il test usa più stagioni del modello per avere più partite su cui misurare
 W_GRID = (0.0, 0.25, 0.5, 0.75, 1.0)
 FINESTRA_GIORNI = 1000  # finestra di addestramento (circa 3 stagioni), come nell'app live
@@ -728,7 +729,7 @@ def esegui_test_completo(df, ridge, halflife, passo, solo_base=False, inizio=Non
             m = adatta_modello(train, t, ridge, halflife, True)
             cnt = pd.concat([train["HomeTeam"], train["AwayTeam"]]).value_counts()
             m_freq = matrice_frequenze(train)
-            S_blocco = tabella_split(train, data_rif=t, halflife=halflife)
+            S_blocco = tabella_split(train, data_rif=t, halflife=HALFLIFE_SPLIT)
             m_t, conv = None, None
             if ha_tiri and not solo_base:
                 tr_t = train.dropna(subset=["HST", "AST"])
@@ -1770,7 +1771,7 @@ modello_tiri = modello_tiri_corrente(div, par["ridge"], par["halflife"], giorno)
 M_freq_live = matrice_frequenze(df_storico)
 freq_combo = frequenze_combo(df_storico)
 quota_pt = quota_primo_tempo(df_storico)
-split_live = tabella_split(df_storico, data_rif=oggi_ts, halflife=par["halflife"])
+split_live = tabella_split(df_storico, data_rif=oggi_ts, halflife=HALFLIFE_SPLIT)
 quote_fixtures = {}
 if fx is not None:
     for _, _r in fx.iterrows():
