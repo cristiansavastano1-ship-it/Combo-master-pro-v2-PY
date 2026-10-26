@@ -1554,6 +1554,8 @@ def frequenze_combo(df):
             for nome, h in (("1° tempo", h1), ("2° tempo", h2)):
                 for a, b in [(0, 1), (1, 2), (1, 3), (2, 3), (2, 4)]:
                     out[f"{nome} {a}-{b} gol"] = float(((h >= a) & (h <= b)).mean())
+                out[f"{nome} 0 gol"] = float((h == 0).mean())
+                out[f"{nome} 1 gol"] = float((h == 1).mean())
                 out[f"{nome} almeno 1 gol"] = float((h >= 1).mean())
                 out[f"{nome} almeno 2 gol"] = float((h >= 2).mean())
             out["Primo tempo più gol"] = float((h1 > h2).mean())
@@ -1609,12 +1611,29 @@ def probs_tempi(M_gol, S):
     return joint.sum(axis=1), joint.sum(axis=0), joint
 
 
+def _finestra_sopra_media(finestre, freq, nome):
+    """Tra le finestre di multigol sceglie quella in cui la probabilità del modello è più sopra la media storica del campionato
+    (la più probabile in assoluto è quasi sempre la stessa); senza media storica ripiega sulla più probabile.
+    Restituisce (finestra, probabilità, media storica oppure None)."""
+    medie = {k: freq.get(f"{nome} {k} gol") for k in finestre} if freq else {}
+    if medie and all(v is not None for v in medie.values()):
+        k = max(finestre, key=lambda x: finestre[x] - medie[x])
+        return k, finestre[k], medie[k]
+    k = max(finestre, key=finestre.get)
+    return k, finestre[k], None
+
+
+def _testo_multigol(p, f):
+    return f"{p * 100:.1f}% (media {f * 100:.1f}%)" if f is not None else f"{p * 100:.1f}%"
+
+
 def tabelle_tempi(M_gol, S, freq=None):
     p1, p2, pm = probs_tempi(M_gol, S)
     out = {}
 
     def righe(p, nome):
-        rows = [_riga_prob(f"{nome} {a}-{b} gol", p[a:b + 1].sum(), freq) for a, b in [(0, 1), (1, 2), (1, 3), (2, 3), (2, 4)]]
+        rows = [_riga_prob(f"{nome} 0 gol", p[0], freq), _riga_prob(f"{nome} 1 gol", p[1], freq)]
+        rows += [_riga_prob(f"{nome} {a}-{b} gol", p[a:b + 1].sum(), freq) for a, b in [(0, 1), (1, 2), (1, 3), (2, 3), (2, 4)]]
         rows.append(_riga_prob(f"{nome} almeno 1 gol", 1 - p[0], freq))
         rows.append(_riga_prob(f"{nome} almeno 2 gol", 1 - p[0] - p[1], freq))
         return pd.DataFrame(rows)
@@ -1622,10 +1641,9 @@ def tabelle_tempi(M_gol, S, freq=None):
     out["piu_gol"] = pd.DataFrame([_riga_prob("Primo tempo più gol", np.tril(pm, -1).sum(), freq),
                                    _riga_prob("Gol uguali nei due tempi", np.trace(pm), freq),
                                    _riga_prob("Secondo tempo più gol", np.triu(pm, 1).sum(), freq)])
-    for chiave, p in (("t1", p1), ("t2", p2)):
+    for chiave, p, nome_t in (("t1", p1, "1° tempo"), ("t2", p2, "2° tempo")):
         w2 = {f"{a}-{b}": float(p[a:b + 1].sum()) for a, b in [(0, 1), (1, 2), (2, 3)]}
-        out[chiave + "_best"] = max(w2, key=w2.get)
-        out[chiave + "_best_p"] = w2[out[chiave + "_best"]]
+        out[chiave + "_best"], out[chiave + "_best_p"], out[chiave + "_best_f"] = _finestra_sopra_media(w2, freq, nome_t)
     piu = {"1° tempo": float(np.tril(pm, -1).sum()), "Pari": float(np.trace(pm)), "2° tempo": float(np.triu(pm, 1).sum())}
     out["piu_best"], out["piu_best_p"] = max(piu, key=piu.get), max(piu.values())
     return out
@@ -1638,8 +1656,7 @@ def tabelle_squadre(M_gol, freq=None):
         rows += [_riga_prob(f"{nome} {a}-{b} gol", marg[a:b + 1].sum(), freq) for a, b in [(0, 1), (1, 2), (1, 3), (2, 3), (2, 4)]]
         out[chiave] = pd.DataFrame(rows)
         w2 = {f"{a}-{b}": float(marg[a:b + 1].sum()) for a, b in [(0, 1), (1, 2), (2, 3)]}
-        out[chiave + "_best"] = max(w2, key=w2.get)
-        out[chiave + "_best_p"] = w2[out[chiave + "_best"]]
+        out[chiave + "_best"], out[chiave + "_best_p"], out[chiave + "_best_f"] = _finestra_sopra_media(w2, freq, nome)
     return out
 
 
@@ -1935,12 +1952,15 @@ def mostra_analisi(casa, trasf, data, ora):
                "anche la percentuale più alta perde spesso. Se i casi simili sono pochi o mancano, la percentuale è poco verificata.")
     u1_, u2_, u3_ = st.columns(3)
     u1_.metric("Doppia chance con la X più probabile", pr["doppia_x_best"], f"{pp[pr['doppia_x_best']]*100:.1f}%", delta_color="off")
-    u2_.metric("Multigol casa più probabile (2 gol)", ps["casa_best"] + " gol", f"{ps['casa_best_p']*100:.1f}%", delta_color="off")
-    u3_.metric("Multigol trasferta più probabile (2 gol)", ps["trasf_best"] + " gol", f"{ps['trasf_best_p']*100:.1f}%", delta_color="off")
+    u2_.metric("Multigol casa più sopra la media (2 gol)", ps["casa_best"] + " gol", _testo_multigol(ps["casa_best_p"], ps["casa_best_f"]), delta_color="off")
+    u3_.metric("Multigol trasferta più sopra la media (2 gol)", ps["trasf_best"] + " gol", _testo_multigol(ps["trasf_best_p"], ps["trasf_best_f"]), delta_color="off")
     v1_, v2_, v3_ = st.columns(3)
-    v1_.metric("Multigol 1° tempo più probabile (2 gol)", pt["t1_best"] + " gol", f"{pt['t1_best_p']*100:.1f}%", delta_color="off")
-    v2_.metric("Multigol 2° tempo più probabile (2 gol)", pt["t2_best"] + " gol", f"{pt['t2_best_p']*100:.1f}%", delta_color="off")
+    v1_.metric("Multigol 1° tempo più sopra la media (2 gol)", pt["t1_best"] + " gol", _testo_multigol(pt["t1_best_p"], pt["t1_best_f"]), delta_color="off")
+    v2_.metric("Multigol 2° tempo più sopra la media (2 gol)", pt["t2_best"] + " gol", _testo_multigol(pt["t2_best_p"], pt["t2_best_f"]), delta_color="off")
     v3_.metric("Tempo con più gol", pt["piu_best"], f"{pt['piu_best_p']*100:.1f}%", delta_color="off")
+    st.caption("Multigol da 2 gol (0-1, 1-2, 2-3): la finestra mostrata è quella in cui il modello sta più sopra la media storica del campionato, "
+               "non la più probabile in assoluto, che sarebbe quasi sempre la stessa. Sopra la media non significa valore: non c'è una quota con cui confrontarla. "
+               "Nelle tabelle in basso trovi tutte le finestre e le percentuali di 0, 1 e 2+ gol con la media accanto.")
     gap = abs(pp["1"] - pp["2"]) * 100
     st.caption(f"La X vale {pp['X']*100:.1f}% (media storica del campionato: {freq_combo['X']*100:.1f}%) e la differenza tra 1 e 2 è di {gap:.1f} punti. "
                "La X è quasi mai l'esito singolo più probabile, anche con le quote del mercato: nelle partite equilibrate guarda la doppia chance. "
