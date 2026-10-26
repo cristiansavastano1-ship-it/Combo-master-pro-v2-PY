@@ -4,6 +4,7 @@ import time
 import math
 import re
 import unicodedata
+import zipfile
 from datetime import date
 
 import numpy as np
@@ -2202,6 +2203,102 @@ with tab_monte_carlo:
                                   title="Distribuzione Frequenza Gol Totali (Iterazioni Monte Carlo)", template="plotly_dark")
             st.plotly_chart(fig_mc, use_container_width=True)
 
+# ======================= NUOVE FUNZIONI: TEMPI PER STAGIONE E TEST SU TUTTI I CAMPIONATI =======================
+def tabella_tempi_per_stagione(df):
+    """Come si dividono davvero i gol dei due tempi, stagione per stagione: quota di partite con 0, 1, 2+ gol e con 0-1 / 1-2 gol."""
+    if df is None or not {"HTHG", "HTAG", "Stag", "FTHG", "FTAG"}.issubset(df.columns):
+        return pd.DataFrame()
+    d = df.dropna(subset=["HTHG", "HTAG"])
+    if len(d) < 100:
+        return pd.DataFrame()
+    h1 = (d["HTHG"] + d["HTAG"]).to_numpy().astype(int)
+    h2 = ((d["FTHG"] - d["HTHG"]) + (d["FTAG"] - d["HTAG"])).to_numpy().astype(int)
+    stag = d["Stag"].to_numpy().astype(int)
+    oggi = date.today()
+    anno_corrente = oggi.year if oggi.month >= 7 else oggi.year - 1
+
+    def riga(etichetta, tempo, h):
+        n = len(h)
+        p2 = float((h >= 2).mean())
+        return {"Stagione": etichetta, "Tempo": tempo, "Partite": n,
+                "0 gol %": round(float((h == 0).mean()) * 100, 1), "1 gol %": round(float((h == 1).mean()) * 100, 1),
+                "2+ gol %": round(p2 * 100, 1), "± 2+ gol": round(math.sqrt(p2 * (1 - p2) / n) * 100, 1),
+                "0-1 gol %": round(float((h <= 1).mean()) * 100, 1), "1-2 gol %": round(float(((h >= 1) & (h <= 2)).mean()) * 100, 1)}
+    righe = []
+    for tempo, h in (("1° tempo", h1), ("2° tempo", h2)):
+        for y in sorted(set(stag.tolist())):
+            m = stag == y
+            etichetta = f"{y}/{(y + 1) % 100:02d}" + (" (in corso)" if y == anno_corrente else "")
+            righe.append(riga(etichetta, tempo, h[m]))
+        righe.append(riga("Tutte", tempo, h))
+    return pd.DataFrame(righe)
+
+
+NOMI_TABELLE_TEST = ["1_qualita_per_mercato", "2_calibrazione_goal_over", "3_tempi", "4_rendimento_roi",
+                     "5_presi_e_non_presi", "6_risultati_esatti", "7_ultime_25_esatti", "8_squadre_poca_storia"]
+
+
+def esegui_test_campionato(div, giorno):
+    """Stesso test del pulsante 'Esegui test completo', per un campionato qualsiasi (parametri e pesi propri di quel campionato).
+    Restituisce le 8 tabelle, oppure None se i dati non bastano."""
+    df = carica_storico(div, N_STAGIONI_TEST, giorno)
+    if df is None or len(df) < 100:
+        return None
+    par_ = parametri_auto(div, giorno)
+    pesi_ = pesi_blend_auto(div, par_["ridge"], par_["halflife"], giorno)
+    METODO_MARGINE["m"] = pesi_.get("metodo_margine", "proporzionale")
+    res = esegui_test_completo(df, par_["ridge"], par_["halflife"], 14)
+    if res is None:
+        return None
+    tab_a, tab_b, tab_c, tab_d, tab_e, best_ex, tab_cal, tab_roi, tab_tempi = tabelle_test(res, pesi_)
+    return {"tabelle": [tab_a, tab_cal, tab_tempi, tab_roi, tab_b, tab_c, tab_d, tab_e]}
+
+
+def _cella_cal(cal, mercato, fonte, fascia):
+    """Differenza prevista − reale (punti) dalla tabella di calibrazione; fonte può essere un prefisso."""
+    if cal is None or cal.empty:
+        return None
+    m = cal[(cal["Mercato"] == mercato) & (cal["Fascia"] == fascia) & cal["Fonte"].astype(str).str.startswith(fonte)]
+    return None if m.empty else float(m.iloc[0]["Differenza (punti)"])
+
+
+def riepilogo_campionati(risultati):
+    """Una riga per campionato con i numeri che servono a confrontarli (stessi controlli letti a mano dopo ogni test)."""
+    righe = []
+    for nome, r in risultati.items():
+        tab_a, tab_cal, tab_e = r["tabelle"][0], r["tabelle"][1], r["tabelle"][7]
+        riga = {"Campionato": nome}
+        x = tab_a[tab_a["Mercato"] == "1X2"] if tab_a is not None and not tab_a.empty else pd.DataFrame()
+        if not x.empty:
+            x = x.iloc[0]
+            riga["Partite"] = int(x["Partite"])
+            riga["1X2 modello − mercato"] = round(float(x["Modello"]) - float(x["Mercato (chiusura)"]), 4)
+            riga["1X2 ancorato − mercato"] = round(float(x["Ancorato al mercato"]) - float(x["Mercato (chiusura)"]), 4)
+        riga["Goal ancorato (prev. − reale)"] = _cella_cal(tab_cal, "Goal", "Ancorato al mercato", "TUTTE")
+        riga["Over 2.5 modello (prev. − reale)"] = _cella_cal(tab_cal, "Over 2.5", "Modello da solo", "TUTTE")
+        riga["Over 2.5 modello, fascia 60-100%"] = _cella_cal(tab_cal, "Over 2.5", "Modello da solo", "60-100%")
+        if tab_e is not None and not tab_e.empty:
+            for gruppo, etichetta in (("Squadra con meno di 15", "Poca storia: modello − mercato"), ("Tutte le altre", "Altre squadre: modello − mercato")):
+                g_ = tab_e[tab_e["Gruppo"].astype(str).str.startswith(gruppo)]
+                if not g_.empty:
+                    g_ = g_.iloc[0]
+                    riga[etichetta] = round(float(g_["Log loss 1X2 (Modello)"]) - float(g_["Log loss 1X2 (Mercato chiusura)"]), 4)
+        righe.append(riga)
+    return pd.DataFrame(righe)
+
+
+def zip_test_campionati(risultati):
+    """ZIP con le 8 tabelle di ogni campionato in CSV (una cartella per campionato)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for nome, r in risultati.items():
+            cartella = re.sub(r"[^A-Za-z0-9]+", "_", nome.split(" (")[0]).strip("_")
+            for nome_t, tab in zip(NOMI_TABELLE_TEST, r["tabelle"]):
+                if tab is not None and not tab.empty:
+                    z.writestr(f"{cartella}/{nome_t}.csv", "\ufeff" + tab.to_csv(index=False))
+    return buf.getvalue()
+
+
 # --- BACKTEST ---
 with tab_backtest:
     st.subheader("🧪 Backtest walk-forward")
@@ -2339,6 +2436,62 @@ with tab_backtest:
             st.markdown("#### 🆕 Squadre con poca storia (neopromosse)")
             st.dataframe(tab_e, use_container_width=True, hide_index=True)
             st.caption("Stesse partite, tre fonti: se anche il mercato sbaglia di più su queste squadre, non è un difetto solo del modello.")
+
+    st.markdown("---")
+    st.markdown("### 🌍 Test completo su tutti i campionati")
+    st.caption("Stesso test del pulsante 'Esegui test completo' (8 stagioni, parametri e pesi propri di ogni campionato), lanciato in sequenza sui campionati scelti. "
+               "Può richiedere diversi minuti la prima volta di giornata. Alla fine trovi un riepilogo e un file ZIP con le 8 tabelle di ogni campionato.")
+    scelti = st.multiselect("Campionati", list(LEAGUES.keys()), default=list(LEAGUES.keys()), key="tutti_scelti")
+    if st.button("🌍 Esegui test su tutti i campionati"):
+        if not scelti:
+            st.info("Scegli almeno un campionato.")
+        else:
+            risultati_tutti, saltati_tutti = {}, []
+            stato_ = st.empty()
+            barra_ = st.progress(0.0)
+            metodo_prec = METODO_MARGINE["m"]
+            try:
+                for i_, nome_ in enumerate(scelti):
+                    stato_.text(f"{nome_}: calcolo in corso ({i_ + 1} di {len(scelti)})...")
+                    try:
+                        r_ = esegui_test_campionato(LEAGUES[nome_], giorno)
+                    except Exception as e_:
+                        saltati_tutti.append(f"{nome_} (errore: {e_})")
+                        r_ = None
+                    if r_ is None:
+                        if not any(sa_.startswith(nome_) for sa_ in saltati_tutti):
+                            saltati_tutti.append(f"{nome_} (dati insufficienti)")
+                    else:
+                        risultati_tutti[nome_] = r_
+                    barra_.progress((i_ + 1) / len(scelti))
+            finally:
+                METODO_MARGINE["m"] = metodo_prec
+            stato_.empty()
+            barra_.empty()
+            st.session_state["tutti"] = (risultati_tutti, saltati_tutti, giorno)
+    tut = st.session_state.get("tutti")
+    if tut is not None and tut[2] == giorno:
+        if tut[1]:
+            st.warning("Non completati: " + "; ".join(tut[1]))
+        if tut[0]:
+            st.markdown("#### Riepilogo dei campionati")
+            st.dataframe(riepilogo_campionati(tut[0]), use_container_width=True, hide_index=True)
+            st.caption("Log loss: più basso è meglio; 'modello − mercato' positivo = il modello è peggiore delle quote di chiusura. "
+                       "Per Goal e Over 2.5, 'prev. − reale' negativo = il programma sottostima. Il dettaglio completo di ogni campionato è nel file ZIP.")
+            st.download_button("⬇ Scarica le tabelle di tutti i campionati (ZIP)", data=zip_test_campionati(tut[0]),
+                               file_name=f"test_completo_{tut[2]}.zip", mime="application/zip")
+
+    st.markdown("---")
+    st.markdown("### 🕐 Gol per tempo, stagione per stagione")
+    st.caption("Quante partite hanno 0, 1 o 2+ gol nel 1° e nel 2° tempo, per ogni stagione di test (le stesse usate dal Backtest). "
+               "'± 2+ gol' è l'errore statistico: se le stagioni differiscono meno di circa 2 volte quell'errore, il campionato non è cambiato in modo misurabile "
+               "e la media semplice delle stagioni va bene; se differiscono di più, ha senso dare più peso alle stagioni recenti. L'ultima stagione è parziale.")
+    _df_tempi = carica_storico(div, N_STAGIONI_TEST, giorno)
+    _tab_ts = tabella_tempi_per_stagione(_df_tempi)
+    if _tab_ts.empty:
+        st.info("Per questo campionato mancano i dati dei tempi (HTHG/HTAG) o sono troppo pochi.")
+    else:
+        st.dataframe(_tab_ts, use_container_width=True, hide_index=True)
 
     st.markdown("---")
     st.markdown("### 🧊 Test su stagioni mai viste")
