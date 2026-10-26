@@ -2251,7 +2251,7 @@ def esegui_test_campionato(div, giorno):
     if res is None:
         return None
     tab_a, tab_b, tab_c, tab_d, tab_e, best_ex, tab_cal, tab_roi, tab_tempi = tabelle_test(res, pesi_)
-    return {"tabelle": [tab_a, tab_cal, tab_tempi, tab_roi, tab_b, tab_c, tab_d, tab_e]}
+    return {"tabelle": [tab_a, tab_cal, tab_tempi, tab_roi, tab_b, tab_c, tab_d, tab_e], "tempi_stagione": tabella_tempi_per_stagione(df)}
 
 
 def _cella_cal(cal, mercato, fonte, fascia):
@@ -2296,6 +2296,9 @@ def zip_test_campionati(risultati):
             for nome_t, tab in zip(NOMI_TABELLE_TEST, r["tabelle"]):
                 if tab is not None and not tab.empty:
                     z.writestr(f"{cartella}/{nome_t}.csv", "\ufeff" + tab.to_csv(index=False))
+            ts_ = r.get("tempi_stagione")
+            if ts_ is not None and not ts_.empty:
+                z.writestr(f"{cartella}/9_tempi_per_stagione.csv", "\ufeff" + ts_.to_csv(index=False))
     return buf.getvalue()
 
 
