@@ -2254,6 +2254,91 @@ def tabella_tempi_per_stagione(df):
     return pd.DataFrame(righe)
 
 
+def tabella_punteggi_bassi(res):
+    """Stagione per stagione: frequenza reale dei punteggi bassi (0-0, 1-0, 0-1, 1-1) contro quella prevista dal modello nel test a ritroso.
+    Solo un controllo: non cambia nessuna previsione."""
+    if res is None or "Ms" not in res or "date" not in res:
+        return pd.DataFrame()
+    d = pd.to_datetime(pd.Series(res["date"]))
+    stag = np.where(d.dt.month >= 7, d.dt.year, d.dt.year - 1).astype(int)
+    xs, ys = np.asarray(res["xs"]).astype(int), np.asarray(res["ys"]).astype(int)
+    oggi = date.today()
+    anno_corrente = oggi.year if oggi.month >= 7 else oggi.year - 1
+    g = np.add.outer(np.arange(11), np.arange(11))
+
+    def prev(nome, f):
+        M = res["Ms"].get(nome)
+        if M is None or len(M) != len(xs):
+            return np.full(len(xs), np.nan)
+        return f(M)
+    p00 = prev("Modello", lambda M: M[:, 0, 0])
+    p10 = prev("Modello", lambda M: M[:, 1, 0] + M[:, 0, 1])
+    p11 = prev("Modello", lambda M: M[:, 1, 1])
+    p_mod = prev("Modello", lambda M: M[:, :2, :2].sum(axis=(1, 2)))
+    p_sdc = prev("Senza Dixon-Coles", lambda M: M[:, :2, :2].sum(axis=(1, 2)))
+    p_anc = prev("Ancorato al mercato", lambda M: M[:, :2, :2].sum(axis=(1, 2)))
+    gol_prev = prev("Modello", lambda M: (M * g).sum(axis=(1, 2)))
+    r00 = (xs == 0) & (ys == 0)
+    r10 = ((xs == 1) & (ys == 0)) | ((xs == 0) & (ys == 1))
+    r11 = (xs == 1) & (ys == 1)
+    rtot = (xs <= 1) & (ys <= 1)
+    gol = (xs + ys).astype(float)
+
+    def riga(etichetta, m):
+        n = int(m.sum())
+        if n < 20 or np.isnan(p_mod[m]).all():
+            return None
+        pr = float(rtot[m].mean())
+        riga_ = {"Periodo": etichetta, "Partite": n,
+                 "0-0 reale %": round(float(r00[m].mean()) * 100, 1), "0-0 previsto %": round(float(np.nanmean(p00[m])) * 100, 1),
+                 "1-0 o 0-1 reale %": round(float(r10[m].mean()) * 100, 1), "1-0 o 0-1 previsto %": round(float(np.nanmean(p10[m])) * 100, 1),
+                 "1-1 reale %": round(float(r11[m].mean()) * 100, 1), "1-1 previsto %": round(float(np.nanmean(p11[m])) * 100, 1),
+                 "Bassi reali %": round(pr * 100, 1), "± err.": round(math.sqrt(pr * (1 - pr) / n) * 100, 1),
+                 "Bassi previsti % (Modello)": round(float(np.nanmean(p_mod[m])) * 100, 1),
+                 "Differenza Modello (punti)": round((float(np.nanmean(p_mod[m])) - pr) * 100, 1),
+                 "Bassi previsti % (senza Dixon-Coles)": round(float(np.nanmean(p_sdc[m])) * 100, 1) if not np.isnan(p_sdc[m]).all() else None}
+        sub = m & ~np.isnan(p_anc)
+        riga_["Differenza Ancorato (punti)"] = round((float(p_anc[sub].mean()) - float(rtot[sub].mean())) * 100, 1) if sub.sum() >= 20 else None
+        riga_["Gol reali"] = round(float(gol[m].mean()), 2)
+        riga_["Gol previsti"] = round(float(np.nanmean(gol_prev[m])), 2)
+        return riga_
+    righe = []
+    for y in sorted(set(stag.tolist())):
+        r_ = riga(f"{y}/{(y + 1) % 100:02d}" + (" (in corso)" if y == anno_corrente else ""), stag == y)
+        if r_:
+            righe.append(r_)
+    r_ = riga("Tutte", np.ones(len(xs), dtype=bool))
+    if r_:
+        righe.append(r_)
+    ultime = np.zeros(len(xs), dtype=bool)
+    ultime[np.argsort(d.to_numpy(), kind="stable")[-100:]] = True
+    r_ = riga("Ultime 100 partite", ultime)
+    if r_:
+        righe.append(r_)
+    return pd.DataFrame(righe)
+
+
+def riepilogo_punteggi_bassi(risultati):
+    """Punteggi bassi con i campionati sommati (più partite, errore statistico più piccolo)."""
+    tabs = [r.get("punteggi_bassi") for r in risultati.values()]
+    tabs = [t for t in tabs if t is not None and not t.empty]
+    if not tabs:
+        return pd.DataFrame()
+    T = pd.concat(tabs)
+    periodi = sorted(set(T["Periodo"]), key=lambda x: (2 if x.startswith("Ultime") else 1 if x == "Tutte" else 0, x))
+    righe = []
+    for periodo in periodi:
+        gr = T[T["Periodo"] == periodo]
+        w = gr["Partite"].to_numpy().astype(float)
+        n = int(w.sum())
+        pr = float(np.average(gr["Bassi reali %"], weights=w)) / 100
+        pm = float(np.average(gr["Bassi previsti % (Modello)"], weights=w))
+        righe.append({"Periodo": periodo, "Partite": n, "Bassi reali %": round(pr * 100, 1), "± err.": round(math.sqrt(pr * (1 - pr) / n) * 100, 1),
+                      "Bassi previsti % (Modello)": round(pm, 1), "Differenza Modello (punti)": round(pm - pr * 100, 1),
+                      "Gol reali": round(float(np.average(gr["Gol reali"], weights=w)), 2), "Gol previsti": round(float(np.average(gr["Gol previsti"], weights=w)), 2)})
+    return pd.DataFrame(righe)
+
+
 NOMI_TABELLE_TEST = ["1_qualita_per_mercato", "2_calibrazione_goal_over", "3_tempi", "4_rendimento_roi",
                      "5_presi_e_non_presi", "6_risultati_esatti", "7_ultime_25_esatti", "8_squadre_poca_storia"]
 
@@ -2271,7 +2356,7 @@ def esegui_test_campionato(div, giorno):
     if res is None:
         return None
     tab_a, tab_b, tab_c, tab_d, tab_e, best_ex, tab_cal, tab_roi, tab_tempi = tabelle_test(res, pesi_)
-    return {"tabelle": [tab_a, tab_cal, tab_tempi, tab_roi, tab_b, tab_c, tab_d, tab_e], "tempi_stagione": tabella_tempi_per_stagione(df)}
+    return {"tabelle": [tab_a, tab_cal, tab_tempi, tab_roi, tab_b, tab_c, tab_d, tab_e], "tempi_stagione": tabella_tempi_per_stagione(df), "punteggi_bassi": tabella_punteggi_bassi(res)}
 
 
 def _cella_cal(cal, mercato, fonte, fascia):
@@ -2319,6 +2404,9 @@ def zip_test_campionati(risultati):
             ts_ = r.get("tempi_stagione")
             if ts_ is not None and not ts_.empty:
                 z.writestr(f"{cartella}/9_tempi_per_stagione.csv", "\ufeff" + ts_.to_csv(index=False))
+            pb_ = r.get("punteggi_bassi")
+            if pb_ is not None and not pb_.empty:
+                z.writestr(f"{cartella}/10_punteggi_bassi.csv", "\ufeff" + pb_.to_csv(index=False))
     return buf.getvalue()
 
 
@@ -2459,6 +2547,12 @@ with tab_backtest:
             st.markdown("#### 🆕 Squadre con poca storia (neopromosse)")
             st.dataframe(tab_e, use_container_width=True, hide_index=True)
             st.caption("Stesse partite, tre fonti: se anche il mercato sbaglia di più su queste squadre, non è un difetto solo del modello.")
+        tab_pb = tabella_punteggi_bassi(tc)
+        if not tab_pb.empty:
+            st.markdown("#### 📉 Punteggi bassi nel tempo (0-0, 1-0, 0-1, 1-1)")
+            st.dataframe(tab_pb, use_container_width=True, hide_index=True)
+            st.caption("Controllo, non cambia nessuna previsione. Reale contro previsto dal modello nel test a ritroso. Differenza positiva = il modello prevede più punteggi bassi di quanti ne escono. "
+                       "'± err.' è l'errore statistico: differenze entro circa 2 volte quel valore possono essere rumore. L'ultima stagione è parziale.")
 
     st.markdown("---")
     st.markdown("### 🌍 Test completo su tutti i campionati")
@@ -2503,6 +2597,12 @@ with tab_backtest:
                        "Per Goal e Over 2.5, 'prev. − reale' negativo = il programma sottostima. Il dettaglio completo di ogni campionato è nel file ZIP.")
             st.download_button("⬇ Scarica le tabelle di tutti i campionati (ZIP)", data=zip_test_campionati(tut[0]),
                                file_name=f"test_completo_{tut[2]}.zip", mime="application/zip")
+            _pb = riepilogo_punteggi_bassi(tut[0])
+            if not _pb.empty:
+                st.markdown("#### 📉 Punteggi bassi nel tempo, campionati sommati")
+                st.dataframe(_pb, use_container_width=True, hide_index=True)
+                st.caption("0-0, 1-0, 0-1 e 1-1 insieme: reale contro previsto dal modello, con tutti i campionati scelti sommati. Solo un controllo. "
+                           "Differenza positiva = il modello prevede più punteggi bassi del reale. Il dettaglio per campionato è nel file ZIP.")
 
     st.markdown("---")
     st.markdown("### 🕐 Gol per tempo, stagione per stagione")
