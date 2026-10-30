@@ -685,6 +685,7 @@ _MASK = {"p1": _I > _J, "px": _I == _J, "p2": _I < _J, "over1.5": (_I + _J) > 1.
 VARIANTI_TIRI = ["Gol + Tiri 50/50", "Tiri in porta"]
 VARIANTI_NUOVE = ["Livello gol 60", "Livello gol 120", "Correzione 0-0/1-1"]  # varianti sperimentali: solo nel test, non toccano le previsioni
 VARIANTI_MODELLO = ["Modello", "Senza Dixon-Coles", "Ancorato al mercato", "Misto 50/50"] + VARIANTI_TIRI + VARIANTI_NUOVE
+VARIANTE_GOAL = "Goal ricalibrato"  # ritocca solo la percentuale di Goal/No Goal; non è una matrice, quindi sta fuori dalle altre varianti
 VARIANTI = VARIANTI_MODELLO + ["Frequenze storiche"]
 
 
@@ -735,6 +736,18 @@ def _fattore_punteggio(hist, chiave, cella, ancora=300):
     return float(np.clip((reale + a) / (prev + a), 0.6, 1.5))
 
 
+def _scarto_goal(hist, finestra=400, ancora=300):
+    """Variante sperimentale: scarto medio tra Goal reale e Goal previsto dal modello sulle ultime partite già passate del test,
+    ridotto in proporzione a quante sono (ancora = partite virtuali ben calibrate)."""
+    n = len(hist["b"])
+    if n < 100:
+        return 0.0
+    k = min(n, finestra)
+    reale = float(np.mean(hist["b"][-k:]))
+    prev = float(np.mean(hist["pb"][-k:]))
+    return (reale - prev) * k / (k + ancora)
+
+
 def esegui_test_completo(df, ridge, halflife, passo, solo_base=False, inizio=None, leggero=False, varianti_extra=False):
     """Walk-forward come il backtest, ma conserva l'intera distribuzione dei punteggi di ogni variante.
     Con solo_base=True calcola solo Modello e Frequenze storiche (più veloce: serve a scegliere i pesi)."""
@@ -748,7 +761,8 @@ def esegui_test_completo(df, ridge, halflife, passo, solo_base=False, inizio=Non
     Ms = {v: [] for v in VARIANTI}
     ha_tiri = {"HST", "AST"}.issubset(df.columns)
     extra = bool(varianti_extra and not solo_base and not leggero)
-    hist = {"x": [], "y": [], "g": [], "p00": [], "p11": []}  # partite già passate nel test (solo per le varianti sperimentali)
+    hist = {"x": [], "y": [], "g": [], "p00": [], "p11": [], "b": [], "pb": []}  # partite già passate nel test (solo per le varianti sperimentali)
+    pgr_list = []
     while t <= fine:
         blocco = df[(df["Date"] >= t) & (df["Date"] < t + pd.Timedelta(days=passo))]
         train = df[(df["Date"] < t) & (df["Date"] >= t - pd.Timedelta(days=FINESTRA_GIORNI))]
@@ -761,6 +775,7 @@ def esegui_test_completo(df, ridge, halflife, passo, solo_base=False, inizio=Non
             f120 = _fattore_gol(hist, 120) if extra else 1.0
             c00 = _fattore_punteggio(hist, "p00", (0, 0)) if extra else 1.0
             c11 = _fattore_punteggio(hist, "p11", (1, 1)) if extra else 1.0
+            d_goal = _scarto_goal(hist) if extra else 0.0
             m_t, conv = None, None
             if ha_tiri and not solo_base:
                 tr_t = train.dropna(subset=["HST", "AST"])
@@ -827,6 +842,10 @@ def esegui_test_completo(df, ridge, halflife, passo, solo_base=False, inizio=Non
                 hist["g"].append(float(lh + la))
                 hist["p00"].append(float(Mb[0, 0]))
                 hist["p11"].append(float(Mb[1, 1]))
+                pb_ = float(Mb[1:, 1:].sum())
+                hist["b"].append(1.0 if (int(r["FTHG"]) > 0 and int(r["FTAG"]) > 0) else 0.0)
+                hist["pb"].append(pb_)
+                pgr_list.append(float(np.clip(pb_ + d_goal, 0.02, 0.98)) if extra else np.nan)
         t += pd.Timedelta(days=passo)
     if not rec["xs"]:
         return None
@@ -834,6 +853,7 @@ def esegui_test_completo(df, ridge, halflife, passo, solo_base=False, inizio=Non
     out["Partita"] = rec["Partita"]
     out["Ms"] = {k: np.array(v) for k, v in Ms.items()}
     out["extra"] = extra
+    out["p_goal_ric"] = np.array(pgr_list)
     return out
 
 
@@ -1009,6 +1029,11 @@ def tabelle_test(res, pesi=None):
         for v_n in VARIANTI_NUOVE:
             if v_n in VARIANTI_A:
                 r[f"{v_n} − Modello (± err.)"] = _diff_se(L[v_n], L["Modello"])
+        if mk == "btts" and res.get("extra") and "p_goal_ric" in res and not np.isnan(res["p_goal_ric"][sel]).any():
+            p_g = np.clip(res["p_goal_ric"][sel], 1e-9, 1 - 1e-9)
+            o_g = outc_s["btts"]
+            L_g = -(o_g * np.log(p_g) + (1 - o_g) * np.log(1 - p_g))
+            r[f"{VARIANTE_GOAL} − Modello (± err.)"] = _diff_se(L_g, L["Modello"])
         L_mix = _vettore_perdita(w_best * Mb + (1 - w_best) * Mf, mk, xs_s, ys_s, outc_s, es_s)
         r["Modello+Freq − Frequenze (± err.)"] = _diff_se(L_mix, L["Frequenze storiche"])
         if usa_tiri:
@@ -2395,7 +2420,7 @@ def confronto_varianti(risultati):
     """Varianti sperimentali contro il Modello, campionati sommati. Differenza di log score: negativa = la variante è migliore.
     Verdetto fissato in anticipo: passa se sul risultato esatto migliora di almeno 2 errori standard e sull'1X2 non peggiora oltre 1 errore standard."""
     righe = []
-    for v in VARIANTI_NUOVE:
+    for v in VARIANTI_NUOVE + [VARIANTE_GOAL]:
         col = f"{v} − Modello (± err.)"
         acc = {}
         for r in risultati.values():
@@ -2419,9 +2444,15 @@ def confronto_varianti(risultati):
                           "z": round(d_ / e_, 1) if e_ > 0 else None})
     dett = pd.DataFrame(righe)
     verd = []
-    for v in VARIANTI_NUOVE:
+    for v in VARIANTI_NUOVE + [VARIANTE_GOAL]:
         g = dett[dett["Variante"] == v] if not dett.empty else dett
         if g.empty:
+            continue
+        if v == VARIANTE_GOAL:
+            zg = g.loc[g["Mercato"] == "Goal / No Goal", "z"]
+            zg = float(zg.iloc[0]) if len(zg) and zg.iloc[0] is not None else None
+            verd.append({"Variante": v, "z risultato esatto": None, "z 1X2": None, "z Goal/No Goal": zg,
+                         "Verdetto": "Non valutabile" if zg is None else ("Passa" if zg <= -2 else "Non passa")})
             continue
         ze = g.loc[g["Mercato"] == "Risultato esatto (log score)", "z"]
         z1 = g.loc[g["Mercato"] == "1X2", "z"]
@@ -2431,7 +2462,7 @@ def confronto_varianti(risultati):
             verdetto = "Non valutabile"
         else:
             verdetto = "Passa" if (ze <= -2 and z1 <= 1) else "Non passa"
-        verd.append({"Variante": v, "z risultato esatto": ze, "z 1X2": z1, "Verdetto": verdetto})
+        verd.append({"Variante": v, "z risultato esatto": ze, "z 1X2": z1, "z Goal/No Goal": None, "Verdetto": verdetto})
     return dett, pd.DataFrame(verd)
 
 
@@ -2706,7 +2737,9 @@ with tab_backtest:
                 st.dataframe(_cv, use_container_width=True, hide_index=True)
                 st.caption("Solo nel test: nessuna variante cambia le previsioni dell'app. 'Livello gol' corregge i gol attesi di metà dello scarto tra gol reali e previsti nelle ultime 60 o 120 partite; "
                            "'Correzione 0-0/1-1' riequilibra la frequenza di 0-0 e 1-1 sulle partite già passate. Differenza di log score negativa e z negativo = la variante è meglio del Modello. "
-                           "Regola fissata in anticipo: passa se sul risultato esatto migliora di almeno 2 errori standard (z ≤ −2) e sull'1X2 non peggiora oltre 1 errore standard.")
+                           "Regola fissata in anticipo: passa se sul risultato esatto migliora di almeno 2 errori standard (z ≤ −2) e sull'1X2 non peggiora oltre 1 errore standard. "
+                           "'Goal ricalibrato' ritocca solo la percentuale di Goal/No Goal (scarto medio tra reale e previsto sulle ultime 400 partite già passate, ridotto per i pochi dati) "
+                           "e non tocca gli altri mercati: passa se su Goal/No Goal migliora di almeno 2 errori standard (z ≤ −2).")
 
     st.markdown("---")
     st.markdown("### 🕐 Gol per tempo, stagione per stagione")
