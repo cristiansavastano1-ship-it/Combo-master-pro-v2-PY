@@ -110,7 +110,7 @@ API_CODICI = {"I1": "SA", "E0": "PL", "SP1": "PD", "D1": "BL1", "F1": "FL1", "N1
 BASE_URL = "https://football-data.co.uk"
 UA = {"User-Agent": "Mozilla/5.0"}
 N_STAGIONI = 3
-VERSIONE_TEST = 7  # cambia quando cambia la struttura dei risultati del test (invalida la cache)
+VERSIONE_TEST = 8  # cambia quando cambia la struttura dei risultati del test (invalida la cache)
 N_STAGIONI_TEST = 8  # il test usa più stagioni del modello per avere più partite su cui misurare
 W_GRID = (0.0, 0.25, 0.5, 0.75, 1.0)
 FINESTRA_GIORNI = 1000  # finestra di addestramento (circa 3 stagioni), come nell'app live
@@ -683,7 +683,8 @@ _I, _J = np.meshgrid(np.arange(11), np.arange(11), indexing="ij")
 _MASK = {"p1": _I > _J, "px": _I == _J, "p2": _I < _J, "over1.5": (_I + _J) > 1.5, "over2.5": (_I + _J) > 2.5,
          "over3.5": (_I + _J) > 3.5, "btts": (_I > 0) & (_J > 0)}
 VARIANTI_TIRI = ["Gol + Tiri 50/50", "Tiri in porta"]
-VARIANTI_MODELLO = ["Modello", "Senza Dixon-Coles", "Ancorato al mercato", "Misto 50/50"] + VARIANTI_TIRI
+VARIANTI_NUOVE = ["Livello gol 60", "Livello gol 120", "Correzione 0-0/1-1"]  # varianti sperimentali: solo nel test, non toccano le previsioni
+VARIANTI_MODELLO = ["Modello", "Senza Dixon-Coles", "Ancorato al mercato", "Misto 50/50"] + VARIANTI_TIRI + VARIANTI_NUOVE
 VARIANTI = VARIANTI_MODELLO + ["Frequenze storiche"]
 
 
@@ -710,7 +711,31 @@ def matrice_ancorata(p1x2, p_over25, rho, start):
     return matrice_punteggi(math.exp(res.x[0]), math.exp(res.x[1]), rho)
 
 
-def esegui_test_completo(df, ridge, halflife, passo, solo_base=False, inizio=None, leggero=False):
+def _fattore_gol(hist, n, quota=0.5):
+    """Variante sperimentale: quanto il campionato sta segnando più (o meno) del previsto nelle ultime n partite del test, applicato a metà."""
+    if len(hist["x"]) < n:
+        return 1.0
+    reali = float(np.mean(np.array(hist["x"][-n:]) + np.array(hist["y"][-n:])))
+    prev = float(np.mean(hist["g"][-n:]))
+    if prev <= 0:
+        return 1.0
+    return float(np.clip(1 + quota * (reali / prev - 1), 0.85, 1.20))
+
+
+def _fattore_punteggio(hist, chiave, cella, ancora=300):
+    """Variante sperimentale: rapporto tra frequenza reale e prevista di un punteggio (0-0 o 1-1) sulle partite già passate del test,
+    tirato verso 1 con 'ancora' partite virtuali ben calibrate, così non scatta con pochi dati."""
+    n = len(hist["x"])
+    if n < 100:
+        return 1.0
+    x, y = np.array(hist["x"]), np.array(hist["y"])
+    reale = float(((x == cella[0]) & (y == cella[1])).sum())
+    prev = float(np.sum(hist[chiave]))
+    a = ancora * prev / n
+    return float(np.clip((reale + a) / (prev + a), 0.6, 1.5))
+
+
+def esegui_test_completo(df, ridge, halflife, passo, solo_base=False, inizio=None, leggero=False, varianti_extra=False):
     """Walk-forward come il backtest, ma conserva l'intera distribuzione dei punteggi di ogni variante.
     Con solo_base=True calcola solo Modello e Frequenze storiche (più veloce: serve a scegliere i pesi)."""
     stagioni = sorted(df["Stag"].unique())
@@ -722,6 +747,8 @@ def esegui_test_completo(df, ridge, halflife, passo, solo_base=False, inizio=Non
     rec = {"Partita": [], "xs": [], "ys": [], "ok": [], "ou_ok": [], "m1x2": [], "mou": [], "min_storia": [], "tiri_ok": [], "date": [], "q": [], "ht": [], "split": []}
     Ms = {v: [] for v in VARIANTI}
     ha_tiri = {"HST", "AST"}.issubset(df.columns)
+    extra = bool(varianti_extra and not solo_base and not leggero)
+    hist = {"x": [], "y": [], "g": [], "p00": [], "p11": []}  # partite già passate nel test (solo per le varianti sperimentali)
     while t <= fine:
         blocco = df[(df["Date"] >= t) & (df["Date"] < t + pd.Timedelta(days=passo))]
         train = df[(df["Date"] < t) & (df["Date"] >= t - pd.Timedelta(days=FINESTRA_GIORNI))]
@@ -730,6 +757,10 @@ def esegui_test_completo(df, ridge, halflife, passo, solo_base=False, inizio=Non
             cnt = pd.concat([train["HomeTeam"], train["AwayTeam"]]).value_counts()
             m_freq = matrice_frequenze(train)
             S_blocco = tabella_split(train)
+            f60 = _fattore_gol(hist, 60) if extra else 1.0
+            f120 = _fattore_gol(hist, 120) if extra else 1.0
+            c00 = _fattore_punteggio(hist, "p00", (0, 0)) if extra else 1.0
+            c11 = _fattore_punteggio(hist, "p11", (1, 1)) if extra else 1.0
             m_t, conv = None, None
             if ha_tiri and not solo_base:
                 tr_t = train.dropna(subset=["HST", "AST"])
@@ -745,6 +776,15 @@ def esegui_test_completo(df, ridge, halflife, passo, solo_base=False, inizio=Non
                 Mb = matrice_punteggi(lh, la, m["rho"])
                 Mgt = Mt = nan_m
                 tiri_ok = False
+                if extra:
+                    M60 = matrice_punteggi(lh * f60, la * f60, m["rho"])
+                    M120 = matrice_punteggi(lh * f120, la * f120, m["rho"])
+                    Mcorr = Mb.copy()
+                    Mcorr[0, 0] *= c00
+                    Mcorr[1, 1] *= c11
+                    Mcorr = Mcorr / Mcorr.sum()
+                else:
+                    M60 = M120 = Mcorr = nan_m
                 if m_t is not None:
                     lth, lta = lambda_partita(m_t, h, a)
                     ls_h, ls_a = lth * conv[0], lta * conv[1]
@@ -779,14 +819,21 @@ def esegui_test_completo(df, ridge, halflife, passo, solo_base=False, inizio=Non
                 rec["min_storia"].append(int(min(cnt.get(h, 0), cnt.get(a, 0))))
                 rec["tiri_ok"].append(tiri_ok)
                 for nome, Mv in {"Modello": Mb, "Senza Dixon-Coles": Mn, "Ancorato al mercato": Ma, "Misto 50/50": Mx,
-                                 "Gol + Tiri 50/50": Mgt, "Tiri in porta": Mt, "Frequenze storiche": m_freq}.items():
+                                 "Gol + Tiri 50/50": Mgt, "Tiri in porta": Mt, "Frequenze storiche": m_freq,
+                                 "Livello gol 60": M60, "Livello gol 120": M120, "Correzione 0-0/1-1": Mcorr}.items():
                     Ms[nome].append(Mv)
+                hist["x"].append(min(int(r["FTHG"]), 10))
+                hist["y"].append(min(int(r["FTAG"]), 10))
+                hist["g"].append(float(lh + la))
+                hist["p00"].append(float(Mb[0, 0]))
+                hist["p11"].append(float(Mb[1, 1]))
         t += pd.Timedelta(days=passo)
     if not rec["xs"]:
         return None
     out = {k: np.array(v) for k, v in rec.items() if k != "Partita"}
     out["Partita"] = rec["Partita"]
     out["Ms"] = {k: np.array(v) for k, v in Ms.items()}
+    out["extra"] = extra
     return out
 
 
@@ -919,7 +966,9 @@ def tabelle_test(res, pesi=None):
     # Le varianti con i tiri si confrontano solo se i tiri in porta sono disponibili per (quasi) tutte le partite
     usa_tiri = res.get("tiri_ok") is not None and bool(res["tiri_ok"].mean() >= 0.5)
     VARIANTI_A = VARIANTI if usa_tiri else [v for v in VARIANTI if v not in VARIANTI_TIRI]
-    VARIANTI_MOD_A = [v for v in VARIANTI_MODELLO if v in VARIANTI_A]
+    if not res.get("extra"):
+        VARIANTI_A = [v for v in VARIANTI_A if v not in VARIANTI_NUOVE]
+    VARIANTI_MOD_A = [v for v in VARIANTI_MODELLO if v in VARIANTI_A and v not in VARIANTI_NUOVE]
     xs, ys = res["xs"], res["ys"]
     ok = res["ok"] & res["tiri_ok"] if usa_tiri else res["ok"]
     ou_ok = res["ou_ok"] & res["tiri_ok"] if usa_tiri else res["ou_ok"]
@@ -957,6 +1006,9 @@ def tabelle_test(res, pesi=None):
             r["Mercato (chiusura)"] = None
         r["Modello − Frequenze (± err.)"] = _diff_se(L["Modello"], L["Frequenze storiche"])
         r["Ancorato − Modello (± err.)"] = _diff_se(L["Ancorato al mercato"], L["Modello"])
+        for v_n in VARIANTI_NUOVE:
+            if v_n in VARIANTI_A:
+                r[f"{v_n} − Modello (± err.)"] = _diff_se(L[v_n], L["Modello"])
         L_mix = _vettore_perdita(w_best * Mb + (1 - w_best) * Mf, mk, xs_s, ys_s, outc_s, es_s)
         r["Modello+Freq − Frequenze (± err.)"] = _diff_se(L_mix, L["Frequenze storiche"])
         if usa_tiri:
@@ -1064,7 +1116,7 @@ def tabelle_test(res, pesi=None):
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def test_completo_cached(div, ridge, halflife, passo, giorno, versione):
     df = carica_storico(div, N_STAGIONI_TEST, giorno)
-    return None if df is None else esegui_test_completo(df, ridge, halflife, passo)
+    return None if df is None else esegui_test_completo(df, ridge, halflife, passo, varianti_extra=True)
 
 
 def _campioni(M1x2, Mgol, esito, outc):
@@ -1855,6 +1907,10 @@ def mostra_analisi(casa, trasf, data, ora):
     M = d["M_es"]
     mk = mercati(d["M_1x2"])
     mg = mercati(d["M_gol"])
+    soglia_x = pesi.get("soglia_x", {}).get("ancorato" if d["ancorata"] else "modello")
+    pr = tabelle_pronostico(d["M_1x2"], d["M_gol"], freq_combo, soglia_x)
+    pt = tabelle_tempi(d["M_gol"], split_live, freq_combo)
+    ps = tabelle_squadre(d["M_gol"], freq_combo)
     st.markdown(
         f"""
         <div style="background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%); border: 1px solid #312e81; border-radius: 20px; padding: 18px 25px; margin-top: 20px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5); display:flex; justify-content:space-between; align-items:center;">
@@ -1864,6 +1920,40 @@ def mostra_analisi(casa, trasf, data, ora):
         """,
         unsafe_allow_html=True,
     )
+    pp = pr["p"]
+    st.markdown("#### 🎯 Il pronostico")
+    r1, r2, r3, r4 = st.columns(4)
+    dx = (pp[pr["pronostico"]] - pp["X"]) * 100
+    gap12 = abs(pp["1"] - pp["2"]) * 100
+    equilibrata = pr["pronostico"] != "X" and gap12 <= 8 and pp["X"] >= 0.25
+    r1.metric("Pronostico 1X2", NOMI_ESITO[pr["pronostico"]], f"{pp[pr['pronostico']]*100:.1f}%" + (" · partita equilibrata" if equilibrata else "") + (" · X scelta dalla soglia del backtest" if pr["x_regola"] else ""), delta_color="off")
+    r2.metric("Doppia chance più probabile", pr["doppia_best"], f"{pp[pr['doppia_best']]*100:.1f}%", delta_color="off")
+    cg = pr["combo_goal"].iloc[0]
+    r3.metric("Combo più probabile (1X2 + Goal)", cg["Mercato"], f"{cg['Probabilità %']:.1f}%", delta_color="off")
+    r4.metric("Multigol più probabile (3 gol)", pr["multigol_best"] + " gol", f"{pr['multigol_best_p']*100:.1f}%", delta_color="off")
+    if equilibrata:
+        st.info(f"⚖️ Partita equilibrata: 1 e 2 sono a {gap12:.1f} punti e la X vale {pp['X']*100:.1f}% (a {dx:.1f} punti dal pronostico). "
+                f"Il pareggio qui è un esito molto concreto: nel campionato esce circa il {freq_combo['X']*100:.0f}% delle volte e di più nelle partite equilibrate "
+                "(nei backtest circa il 30%). Un solo esito resta più probabile, ma 1X / X2 coprono bene il pareggio.")
+    s1, s2, s3 = st.columns(3)
+    cs = pr["combo_goal"].sort_values("Differenza (punti)", ascending=False).iloc[0]
+    s1.metric("Più sopra la media (1X2 + Goal)", cs["Mercato"], f"{cs['Differenza (punti)']:+.1f} punti rispetto alla media storica", delta_color="off")
+    co1 = pr["combo_ou"].iloc[0]
+    s2.metric("Combo più probabile (1X2 + Over/Under 2.5)", co1["Mercato"], f"{co1['Probabilità %']:.1f}%", delta_color="off")
+    cs2 = pr["combo_ou"].sort_values("Differenza (punti)", ascending=False).iloc[0]
+    s3.metric("Più sopra la media (1X2 + Over/Under 2.5)", cs2["Mercato"], f"{cs2['Differenza (punti)']:+.1f} punti rispetto alla media storica", delta_color="off")
+    k1_, k2_, k3_ = st.columns(3)
+    c25 = lambda df_: df_[df_["Mercato"].str.contains("2.5")].iloc[0]
+    kd = c25(pr["combo_doppie_ou"])
+    kg = c25(pr["combo_goal_ou"])
+    kdg = pr["combo_doppie_goal"].iloc[0]
+    k1_.metric("Doppia chance + Over/Under 2.5 più probabile", kd["Mercato"], f"{kd['Probabilità %']:.1f}%", delta_color="off")
+    k2_.metric("Goal + Over/Under 2.5 più probabile", kg["Mercato"], f"{kg['Probabilità %']:.1f}%", delta_color="off")
+    k3_.metric("Doppia chance + Goal più probabile", kdg["Mercato"], f"{kdg['Probabilità %']:.1f}%", delta_color="off")
+    st.caption(f"Fonte Goal / Over-Under / Risultati esatti: {d['fonte']}.")
+    if not d["ancorata"]:
+        st.warning("⚠ Senza le quote del bookmaker, Goal/No Goal e Over/Under hanno poco potere predittivo: nel backtest su circa 1200 partite "
+                   "non hanno battuto in modo netto le semplici frequenze storiche. Considerali indicativi, vicini alla media del campionato.")
     col_sq, col_st = st.columns([1.2, 1.8])
     with col_sq:
         st.markdown(
@@ -1895,44 +1985,6 @@ def mostra_analisi(casa, trasf, data, ora):
             )
     st.markdown(f"<h3>🔬 Analisi Poisson / Dixon-Coles & Mercati: {casa} vs {trasf}</h3>", unsafe_allow_html=True)
     curve_ = pesi.get("curve", {}).get("con" if d["ancorata"] else "senza")
-    st.caption(f"Fonte Goal / Over-Under / Risultati esatti: {d['fonte']}.")
-    if not d["ancorata"]:
-        st.warning("⚠ Senza le quote del bookmaker, Goal/No Goal e Over/Under hanno poco potere predittivo: nel backtest su circa 1200 partite "
-                   "non hanno battuto in modo netto le semplici frequenze storiche. Considerali indicativi, vicini alla media del campionato.")
-    soglia_x = pesi.get("soglia_x", {}).get("ancorato" if d["ancorata"] else "modello")
-    pr = tabelle_pronostico(d["M_1x2"], d["M_gol"], freq_combo, soglia_x)
-    pt = tabelle_tempi(d["M_gol"], split_live, freq_combo)
-    ps = tabelle_squadre(d["M_gol"], freq_combo)
-    pp = pr["p"]
-    st.markdown("#### 🎯 Il pronostico")
-    r1, r2, r3, r4 = st.columns(4)
-    dx = (pp[pr["pronostico"]] - pp["X"]) * 100
-    gap12 = abs(pp["1"] - pp["2"]) * 100
-    equilibrata = pr["pronostico"] != "X" and gap12 <= 8 and pp["X"] >= 0.25
-    r1.metric("Pronostico 1X2", NOMI_ESITO[pr["pronostico"]], f"{pp[pr['pronostico']]*100:.1f}%" + (" · partita equilibrata" if equilibrata else "") + (" · X scelta dalla soglia del backtest" if pr["x_regola"] else ""), delta_color="off")
-    r2.metric("Doppia chance più probabile", pr["doppia_best"], f"{pp[pr['doppia_best']]*100:.1f}%", delta_color="off")
-    cg = pr["combo_goal"].iloc[0]
-    r3.metric("Combo più probabile (1X2 + Goal)", cg["Mercato"], f"{cg['Probabilità %']:.1f}%", delta_color="off")
-    r4.metric("Multigol più probabile (3 gol)", pr["multigol_best"] + " gol", f"{pr['multigol_best_p']*100:.1f}%", delta_color="off")
-    if equilibrata:
-        st.info(f"⚖️ Partita equilibrata: 1 e 2 sono a {gap12:.1f} punti e la X vale {pp['X']*100:.1f}% (a {dx:.1f} punti dal pronostico). "
-                f"Il pareggio qui è un esito molto concreto: nel campionato esce circa il {freq_combo['X']*100:.0f}% delle volte e di più nelle partite equilibrate "
-                "(nei backtest circa il 30%). Un solo esito resta più probabile, ma 1X / X2 coprono bene il pareggio.")
-    s1, s2, s3 = st.columns(3)
-    cs = pr["combo_goal"].sort_values("Differenza (punti)", ascending=False).iloc[0]
-    s1.metric("Più sopra la media (1X2 + Goal)", cs["Mercato"], f"{cs['Differenza (punti)']:+.1f} punti rispetto alla media storica", delta_color="off")
-    co1 = pr["combo_ou"].iloc[0]
-    s2.metric("Combo più probabile (1X2 + Over/Under 2.5)", co1["Mercato"], f"{co1['Probabilità %']:.1f}%", delta_color="off")
-    cs2 = pr["combo_ou"].sort_values("Differenza (punti)", ascending=False).iloc[0]
-    s3.metric("Più sopra la media (1X2 + Over/Under 2.5)", cs2["Mercato"], f"{cs2['Differenza (punti)']:+.1f} punti rispetto alla media storica", delta_color="off")
-    k1_, k2_, k3_ = st.columns(3)
-    c25 = lambda df_: df_[df_["Mercato"].str.contains("2.5")].iloc[0]
-    kd = c25(pr["combo_doppie_ou"])
-    kg = c25(pr["combo_goal_ou"])
-    kdg = pr["combo_doppie_goal"].iloc[0]
-    k1_.metric("Doppia chance + Over/Under 2.5 più probabile", kd["Mercato"], f"{kd['Probabilità %']:.1f}%", delta_color="off")
-    k2_.metric("Goal + Over/Under 2.5 più probabile", kg["Mercato"], f"{kg['Probabilità %']:.1f}%", delta_color="off")
-    k3_.metric("Doppia chance + Goal più probabile", kdg["Mercato"], f"{kdg['Probabilità %']:.1f}%", delta_color="off")
     st.markdown("#### 📏 Quanto fidarsi di queste percentuali")
     pg_ = mg["btts"]
     side_g = ("Goal", pg_) if pg_ >= 0.5 else ("No Goal", 1 - pg_)
@@ -2339,6 +2391,50 @@ def riepilogo_punteggi_bassi(risultati):
     return pd.DataFrame(righe)
 
 
+def confronto_varianti(risultati):
+    """Varianti sperimentali contro il Modello, campionati sommati. Differenza di log score: negativa = la variante è migliore.
+    Verdetto fissato in anticipo: passa se sul risultato esatto migliora di almeno 2 errori standard e sull'1X2 non peggiora oltre 1 errore standard."""
+    righe = []
+    for v in VARIANTI_NUOVE:
+        col = f"{v} − Modello (± err.)"
+        acc = {}
+        for r in risultati.values():
+            tab_a = r["tabelle"][0] if r.get("tabelle") else None
+            if tab_a is None or tab_a.empty or col not in tab_a.columns:
+                continue
+            for _, rr in tab_a.iterrows():
+                try:
+                    d_, e_ = (float(x_) for x_ in str(rr[col]).replace("+", "").split("±"))
+                except Exception:
+                    continue
+                a_ = acc.setdefault(rr["Mercato"], [0.0, 0.0, 0.0])
+                n_ = float(rr["Partite"])
+                a_[0] += n_
+                a_[1] += n_ * d_
+                a_[2] += (n_ * e_) ** 2
+        for mercato, (n_, sd_, sv_) in acc.items():
+            d_ = sd_ / n_
+            e_ = math.sqrt(sv_) / n_
+            righe.append({"Variante": v, "Mercato": mercato, "Partite": int(n_), "Differenza log score": round(d_, 5), "± err.": round(e_, 5),
+                          "z": round(d_ / e_, 1) if e_ > 0 else None})
+    dett = pd.DataFrame(righe)
+    verd = []
+    for v in VARIANTI_NUOVE:
+        g = dett[dett["Variante"] == v] if not dett.empty else dett
+        if g.empty:
+            continue
+        ze = g.loc[g["Mercato"] == "Risultato esatto (log score)", "z"]
+        z1 = g.loc[g["Mercato"] == "1X2", "z"]
+        ze = float(ze.iloc[0]) if len(ze) and ze.iloc[0] is not None else None
+        z1 = float(z1.iloc[0]) if len(z1) and z1.iloc[0] is not None else None
+        if ze is None or z1 is None:
+            verdetto = "Non valutabile"
+        else:
+            verdetto = "Passa" if (ze <= -2 and z1 <= 1) else "Non passa"
+        verd.append({"Variante": v, "z risultato esatto": ze, "z 1X2": z1, "Verdetto": verdetto})
+    return dett, pd.DataFrame(verd)
+
+
 NOMI_TABELLE_TEST = ["1_qualita_per_mercato", "2_calibrazione_goal_over", "3_tempi", "4_rendimento_roi",
                      "5_presi_e_non_presi", "6_risultati_esatti", "7_ultime_25_esatti", "8_squadre_poca_storia"]
 
@@ -2352,7 +2448,7 @@ def esegui_test_campionato(div, giorno):
     par_ = parametri_auto(div, giorno)
     pesi_ = pesi_blend_auto(div, par_["ridge"], par_["halflife"], giorno)
     METODO_MARGINE["m"] = pesi_.get("metodo_margine", "proporzionale")
-    res = esegui_test_completo(df, par_["ridge"], par_["halflife"], 14)
+    res = esegui_test_completo(df, par_["ridge"], par_["halflife"], 14, varianti_extra=True)
     if res is None:
         return None
     tab_a, tab_b, tab_c, tab_d, tab_e, best_ex, tab_cal, tab_roi, tab_tempi = tabelle_test(res, pesi_)
@@ -2603,6 +2699,14 @@ with tab_backtest:
                 st.dataframe(_pb, use_container_width=True, hide_index=True)
                 st.caption("0-0, 1-0, 0-1 e 1-1 insieme: reale contro previsto dal modello, con tutti i campionati scelti sommati. Solo un controllo. "
                            "Differenza positiva = il modello prevede più punteggi bassi del reale. Il dettaglio per campionato è nel file ZIP.")
+            _cv, _vv = confronto_varianti(tut[0])
+            if not _vv.empty:
+                st.markdown("#### 🧪 Varianti sperimentali contro il Modello, campionati sommati")
+                st.dataframe(_vv, use_container_width=True, hide_index=True)
+                st.dataframe(_cv, use_container_width=True, hide_index=True)
+                st.caption("Solo nel test: nessuna variante cambia le previsioni dell'app. 'Livello gol' corregge i gol attesi di metà dello scarto tra gol reali e previsti nelle ultime 60 o 120 partite; "
+                           "'Correzione 0-0/1-1' riequilibra la frequenza di 0-0 e 1-1 sulle partite già passate. Differenza di log score negativa e z negativo = la variante è meglio del Modello. "
+                           "Regola fissata in anticipo: passa se sul risultato esatto migliora di almeno 2 errori standard (z ≤ −2) e sull'1X2 non peggiora oltre 1 errore standard.")
 
     st.markdown("---")
     st.markdown("### 🕐 Gol per tempo, stagione per stagione")
