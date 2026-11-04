@@ -1,5 +1,6 @@
 import difflib
 import io
+import json
 import time
 import math
 import re
@@ -16,6 +17,7 @@ import requests
 import streamlit as st
 from scipy.optimize import minimize, minimize_scalar
 from scipy.special import gammaln
+from scipy.stats import nbinom, poisson
 
 # --- CONFIGURAZIONE PAGINA ---
 st.set_page_config(
@@ -119,7 +121,7 @@ COL_PRESA = [("AvgH", "AvgD", "AvgA"), ("B365H", "B365D", "B365A"), ("PSH", "PSD
 COL_CHIUSURA = [("PSCH", "PSCD", "PSCA"), ("AvgCH", "AvgCD", "AvgCA"), ("B365CH", "B365CD", "B365CA")]
 COL_OU_PRESA = [("Avg>2.5", "Avg<2.5"), ("B365>2.5", "B365<2.5"), ("P>2.5", "P<2.5"), ("Max>2.5", "Max<2.5")]
 COL_OU_CHIUSURA = [("AvgC>2.5", "AvgC<2.5"), ("PC>2.5", "PC<2.5"), ("B365C>2.5", "B365C<2.5")]
-STAT_COLONNE = {"Tiri": ("HS", "AS"), "Tiri in Porta": ("HST", "AST"), "Corner": ("HC", "AC"), "Falli": ("HF", "AF")}
+STAT_COLONNE = {"Tiri": ("HS", "AS"), "Tiri in Porta": ("HST", "AST"), "Corner": ("HC", "AC"), "Falli": ("HF", "AF"), "Ammonizioni": ("HY", "AY")}
 
 _STOP_NOMI = {"fc", "ac", "as", "cf", "afc", "acf", "ssc", "us", "ud", "rc", "rcd", "sv", "vfl", "vfb", "fsv", "tsg",
               "fk", "cd", "ca", "sc", "bv", "de", "calcio", "ogc", "sco"}
@@ -1624,14 +1626,193 @@ def _finestra_sopra_media(finestre, freq, nome):
     return k, finestre[k], None
 
 
+# ======================= CHI FARÀ DI PIÙ: TIRI, TIRI IN PORTA, ANGOLI, AMMONIZIONI =======================
+# Per ogni statistica: medie attese delle due squadre (stessa formula delle statistiche attese: casa/trasferta + subito dall'avversario, con shrinkage)
+# e due conteggi binomiali negativi indipendenti, da cui "casa di più", "pari" e "trasferta di più". Nessuna quota su questi mercati.
+CHI_STAT = [("Tiri", "HS", "AS"), ("Tiri in porta", "HST", "AST"), ("Corner", "HC", "AC"), ("Ammonizioni", "HY", "AY")]
+
+
+def _prob_piu_di(mu_h, mu_a, phi):
+    """Probabilità che la casa abbia di più, che sia pari, che abbia di più la trasferta. phi = sovradispersione (0 = Poisson)."""
+    def pmf(mu, n):
+        k = np.arange(n)
+        if phi < 1e-6:
+            return poisson.pmf(k, mu)
+        r = 1.0 / phi
+        return nbinom.pmf(k, r, r / (r + mu))
+    m = max(mu_h, mu_a)
+    n = int(m + 8 * math.sqrt(m * (1 + phi * m)) + 6)
+    M = np.outer(pmf(mu_h, n), pmf(mu_a, n))
+    M = M / M.sum()
+    return float(np.tril(M, -1).sum()), float(np.trace(M)), float(np.triu(M, 1).sum())
+
+
+def _medie_incrementali(df, h, a, k=5, min_lega=100):
+    """Per ogni partita, le medie attese (casa, trasferta) di una statistica calcolate solo con i giorni precedenti, e la sovradispersione stimata
+    sui residui passati. Ritorna (df ordinato, mu_casa, mu_trasf, phi per partita, phi finale)."""
+    d = df.sort_values("Date").reset_index(drop=True)
+    n = len(d)
+    mu_h, mu_a, phi_r = np.full(n, np.nan), np.full(n, np.nan), np.full(n, 0.05)
+    xh, xa = d[h].to_numpy(float), d[a].to_numpy(float)
+    casa, trasf, giorni = d["HomeTeam"].to_numpy(), d["AwayTeam"].to_numpy(), d["Date"].to_numpy()
+    S = {"hh": {}, "ha": {}, "aa": {}, "ah": {}}
+    N_ = {"c": {}, "t": {}}
+    lh = la = 0.0
+    nl = 0
+    num = den = 0.0
+    nres = 0
+    phi = 0.05
+    i = 0
+    while i < n:
+        j = i
+        while j < n and giorni[j] == giorni[i]:
+            j += 1
+        for r in range(i, j):
+            phi_r[r] = phi
+            if nl >= min_lega:
+                c, t = casa[r], trasf[r]
+                lega_h, lega_a = lh / nl, la / nl
+                nc, nt = N_["c"].get(c, 0), N_["t"].get(t, 0)
+                mu_h[r] = ((S["hh"].get(c, 0.0) + k * lega_h) / (nc + k) + (S["ah"].get(t, 0.0) + k * lega_h) / (nt + k)) / 2
+                mu_a[r] = ((S["aa"].get(t, 0.0) + k * lega_a) / (nt + k) + (S["ha"].get(c, 0.0) + k * lega_a) / (nc + k)) / 2
+        for r in range(i, j):
+            if np.isnan(xh[r]) or np.isnan(xa[r]):
+                continue
+            c, t = casa[r], trasf[r]
+            if not np.isnan(mu_h[r]):
+                for x_, m_ in ((xh[r], mu_h[r]), (xa[r], mu_a[r])):
+                    num += (x_ - m_) ** 2 - m_
+                    den += m_ ** 2
+                    nres += 1
+            S["hh"][c] = S["hh"].get(c, 0.0) + xh[r]
+            S["ha"][c] = S["ha"].get(c, 0.0) + xa[r]
+            S["aa"][t] = S["aa"].get(t, 0.0) + xa[r]
+            S["ah"][t] = S["ah"].get(t, 0.0) + xh[r]
+            N_["c"][c] = N_["c"].get(c, 0) + 1
+            N_["t"][t] = N_["t"].get(t, 0) + 1
+            lh += xh[r]
+            la += xa[r]
+            nl += 1
+        if nres >= 200 and den > 0:
+            phi = float(np.clip(num / den, 0.001, 1.0))
+        i = j
+    return d, mu_h, mu_a, phi_r, phi
+
+
+def _perdite_chi(df, h, a):
+    """Walk-forward per una statistica: ritorna (perdite modello, perdite frequenze, probabilità n×3, esiti, phi finale) oppure None."""
+    d, mu_h, mu_a, phi, phi_fin = _medie_incrementali(df, h, a)
+    xh, xa = d[h].to_numpy(float), d[a].to_numpy(float)
+    esito = np.where(xh > xa, 0, np.where(xh == xa, 1, 2))
+    valido = ~(np.isnan(mu_h) | np.isnan(xh) | np.isnan(xa))
+    cnt = np.ones(3)
+    Lm, Lf, P, E = [], [], [], []
+    for r in range(len(d)):
+        if valido[r]:
+            p3 = np.array(_prob_piu_di(mu_h[r], mu_a[r], phi[r]))
+            Lm.append(-math.log(max(p3[esito[r]], 1e-9)))
+            Lf.append(-math.log(cnt[esito[r]] / cnt.sum()))
+            P.append(p3)
+            E.append(esito[r])
+        if not (np.isnan(xh[r]) or np.isnan(xa[r])):
+            cnt[esito[r]] += 1
+    if len(P) < 300:
+        return None
+    return np.array(Lm), np.array(Lf), np.array(P), np.array(E), phi_fin
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def parametri_chi_fa_di_piu(div, giorno):
+    """Per ogni statistica: sovradispersione e z del test a ritroso contro le sole frequenze (negativo = il modello è meglio). Serve alla scheda partita."""
+    df = carica_storico(div, N_STAGIONI_TEST, giorno)
+    out = {}
+    if df is None:
+        return out
+    for nome, h, a in CHI_STAT:
+        if h in df.columns and a in df.columns:
+            r = _perdite_chi(df, h, a)
+            if r is not None:
+                dd = r[0] - r[1]
+                se = dd.std(ddof=1) / math.sqrt(len(dd))
+                out[nome] = {"phi": float(r[4]), "z": float(dd.mean() / se) if se > 0 else 0.0}
+    return out
+
+
+def chi_fa_di_piu(df, casa, trasf, par):
+    """Righe per la scheda partita: chi avrà di più per tiri, tiri in porta, angoli e ammonizioni (con il pareggio), con l'affidabilità misurata nel test."""
+    righe = []
+    for nome, h, a in CHI_STAT:
+        if h not in df.columns or a not in df.columns or nome not in par:
+            continue
+        d = df.dropna(subset=[h, a])
+        if len(d) < 100:
+            continue
+        lega_h, lega_a = d[h].mean(), d[a].mean()
+        sm = lambda serie, lega: (serie.sum() + 5 * lega) / (len(serie) + 5)
+        dc, dt = d[d["HomeTeam"] == casa], d[d["AwayTeam"] == trasf]
+        mh = (sm(dc[h], lega_h) + sm(dt[h], lega_h)) / 2
+        ma = (sm(dt[a], lega_a) + sm(dc[a], lega_a)) / 2
+        pc, pp_, pt = _prob_piu_di(mh, ma, par[nome]["phi"])
+        z = par[nome]["z"]
+        top = max((pc, "Casa"), (pp_, "Pari"), (pt, "Trasferta"))
+        affid = "✅ meglio delle frequenze" if z <= -2 else ("❔ incerta" if z <= -1 else "⚠️ non batte le frequenze")
+        pron = "Equilibrata" if top[0] < 0.45 else f"{top[1]} ({top[0] * 100:.0f}%)"
+        righe.append({"Statistica": nome, "Attesi (casa - trasf.)": f"{mh:.1f} - {ma:.1f}", "Casa di più %": round(pc * 100, 1), "Pari %": round(pp_ * 100, 1),
+                      "Trasferta di più %": round(pt * 100, 1), "Pronostico": pron if z <= -1 else "nessuna indicazione", "Affidabilità": affid})
+    return righe
+
+
+def test_chi_fa_di_piu(df):
+    """Walk-forward: per ogni partita le medie attese usano solo i giorni precedenti. Confronta il modello con le sole frequenze (casa di più / pari / trasferta di più).
+    Ritorna (tabella log score, tabella calibrazione) oppure None."""
+    righe, cal = [], []
+    for nome, h, a in CHI_STAT:
+        if h not in df.columns or a not in df.columns:
+            continue
+        r = _perdite_chi(df, h, a)
+        if r is None:
+            continue
+        Lm, Lf, pm, ac, _phi = r
+        reale = [float((ac == i).mean()) * 100 for i in range(3)]
+        righe.append({"Statistica": nome, "Partite": len(Lm), "Modello": round(float(Lm.mean()), 4), "Frequenze": round(float(Lf.mean()), 4),
+                      "Modello − Frequenze (± err.)": _diff_se(Lm, Lf),
+                      "Casa di più: previsto %": round(float(pm[:, 0].mean()) * 100, 1), "Casa di più: reale %": round(reale[0], 1),
+                      "Pari: previsto %": round(float(pm[:, 1].mean()) * 100, 1), "Pari: reale %": round(reale[1], 1),
+                      "Trasferta di più: previsto %": round(float(pm[:, 2].mean()) * 100, 1), "Trasferta di più: reale %": round(reale[2], 1)})
+        top, atteso = pm.max(axis=1), pm.argmax(axis=1)
+        for lo, hi, et in ((0, 0.45, "sotto 45%"), (0.45, 0.55, "45-55%"), (0.55, 0.65, "55-65%"), (0.65, 1.01, "oltre 65%")):
+            m = (top >= lo) & (top < hi)
+            if m.sum() >= 20:
+                cal.append({"Statistica": nome, "Fascia del pronostico": et, "Partite": int(m.sum()), "Previsto %": round(float(top[m].mean()) * 100, 1),
+                            "Reale %": round(float((atteso[m] == ac[m]).mean()) * 100, 1),
+                            "Differenza (punti)": round((float(top[m].mean()) - float((atteso[m] == ac[m]).mean())) * 100, 1)})
+    if not righe:
+        return None
+    return pd.DataFrame(righe), pd.DataFrame(cal)
+
+
 _NOMI_SCELTA = {"1": "1 (vince la casa)", "X": "X (pareggio)", "2": "2 (vince la trasferta)",
                 "1X": "1X (la casa non perde)", "X2": "X2 (la trasferta non perde)", "12": "12 (non pareggia)"}
 
 
-def verdetto_partita(pr, mg, d, curve, senza_storico):
-    """Un pronostico netto con il livello di fiducia, ricavato dai numeri già calcolati e dalle curve di calibrazione del backtest
-    (quante volte è davvero uscito un esito con quella probabilità prevista). Livelli sulla frequenza storica: alta da 70%, media da 55%.
-    Ritorna (livello 'alta'/'media'/'bassa', testo in markdown). Non dice se conviene giocarla: il modello non batte le quote."""
+def quote_grezze_partita(casa, trasf):
+    """Quote 1X2 del bookmaker per la partita, se sono nel file delle partite del turno (altrimenti None)."""
+    try:
+        if fx is None:
+            return None
+        m = fx[(fx["HomeTeam"] == casa) & (fx["AwayTeam"] == trasf)]
+        if m.empty:
+            return None
+        q = prima_tripla(m.iloc[0], COL_PRESA)
+        return tuple(float(x) for x in q) if q else None
+    except Exception:
+        return None
+
+
+def scheda_semplice(casa, trasf, pr, d, curve, senza_storico, grezze, gol_casa, gol_trasf, gol_lega):
+    """Riquadro in cima alla scheda: com'è la partita, la giocata, a quale quota ha senso, cosa evitare. Usa i numeri già calcolati e le curve del backtest
+    (quante volte è davvero uscito un esito con quella probabilità prevista; livelli: alta da 70%, media da 55%).
+    Ritorna (livello 'alta'/'media'/'bassa', testo in markdown). Non è un consiglio di profitto: il modello non batte le quote."""
     pp = pr["p"]
     top = pr["pronostico"]
     p_top = pp[top]
@@ -1642,41 +1823,60 @@ def verdetto_partita(pr, mg, d, curve, senza_storico):
         if (f_s[0] if f_s else p_top) >= 0.55:
             scelta, chiave = top, "1x2"
         else:
-            note.append("l'esito secco non supera il 55% nei backtest: scelgo la doppia chance")
+            note.append("l'esito secco non supera il 55% nei backtest, quindi ti propongo la doppia chance")
     p_sc = pp[scelta]
     f_ = cerca_fiducia(curve.get(chiave) if curve else None, p_sc)
     hit = f_[0] if f_ else None
-    ref = hit if hit is not None else p_sc
-    livello = "alta" if ref >= 0.70 else ("media" if ref >= 0.55 else "bassa")
-    if senza_storico and livello != "bassa":
-        livello = "media" if livello == "alta" else "bassa"
-        note.append("una delle due squadre non ha storico (es. neopromossa), quindi abbasso di un livello")
-    if equilibrata:
-        note.append("partita equilibrata: copro il pareggio con la doppia chance")
+    livello = "alta" if (hit if hit is not None else p_sc) >= 0.70 else ("media" if (hit if hit is not None else p_sc) >= 0.55 else "bassa")
+    motivi = []
+    if senza_storico:
+        motivi.append("una delle due squadre non ha storico (neopromossa o inizio stagione)")
+        if livello != "bassa":
+            livello = "media" if livello == "alta" else "bassa"
+    if livello == "bassa" and not motivi:
+        motivi.append("nessun esito è abbastanza probabile da fidarsi")
     if hit is None:
-        note.append("pochi casi simili nel backtest: la fiducia non è verificata e uso la probabilità prevista")
-    etichetta = {"alta": "ALTA", "media": "MEDIA", "bassa": "BASSA"}[livello]
+        note.append("pochi casi simili nel backtest, quindi la fiducia non è verificata")
+    # com'è la partita, a parole
+    if top == "X" or p_top < 0.42:
+        partita_ = f"Partita aperta: nessuna delle due è davvero favorita (1 {pp['1'] * 100:.0f}%, X {pp['X'] * 100:.0f}%, 2 {pp['2'] * 100:.0f}%)."
+    else:
+        forza = "nettamente favorita" if p_top >= 0.65 else ("favorita" if p_top >= 0.52 else "leggermente favorita")
+        partita_ = f"**{casa if top == '1' else trasf}** {forza}: vince circa {p_top * 10:.0f} volte su 10 ({p_top * 100:.0f}%)."
+    tot = gol_casa + gol_trasf
+    gol_ = "più gol del solito" if tot >= gol_lega + 0.3 else ("meno gol del solito" if tot <= gol_lega - 0.3 else "gol nella media")
+    partita_ += f" Il pareggio vale {pp['X'] * 100:.0f}%. Si attendono circa {tot:.1f} gol ({gol_casa:.1f}-{gol_trasf:.1f}), {gol_}."
+    righe = []
     if livello == "bassa":
-        testa = f"**🎯 VERDETTO: PASSA.** Il meglio che c'è è **{_NOMI_SCELTA[scelta]}** al {p_sc * 100:.0f}%, ma la fiducia è **BASSA**."
+        righe.append(f"**🎯 GIOCATA: PASSA.** Il meglio che c'è è {_NOMI_SCELTA[scelta]} al {p_sc * 100:.0f}%, ma la fiducia è **BASSA**.")
+        righe.append("**⏭️ Perché passo:** " + "; ".join(motivi) + ".")
     else:
-        testa = f"**🎯 VERDETTO: {_NOMI_SCELTA[scelta]}** — fiducia **{etichetta}**."
-    righe = [testa]
-    if hit is not None:
-        righe.append(f"Nei backtest, con una probabilità prevista come questa (circa {p_sc * 100:.0f}%) è uscito il **{hit * 100:.0f}%** delle volte ({f_[1]} casi simili).")
-    else:
-        righe.append(f"Probabilità prevista: {p_sc * 100:.0f}%.")
+        titolo = f"**🎯 GIOCATA: {_NOMI_SCELTA[scelta]}** — fiducia **{'ALTA' if livello == 'alta' else 'MEDIA'}**"
+        titolo += f": con questa probabilità è uscita circa {hit * 100:.0f} volte su 100 nei test ({f_[1]} casi)." if hit is not None else "."
+        righe.append(titolo)
+    righe.append("**📖 La partita:** " + partita_)
+    if livello != "bassa":
+        q_equa = 1 / p_sc
+        riga_q = f"**💶 Quota minima: {q_equa:.2f}** (quota equa). "
+        if grezze:
+            qs = dict(zip(("1", "X", "2"), grezze))
+            if scelta in qs:
+                q_b, appr = qs[scelta], ""
+            else:
+                a_, b_ = {"1X": ("1", "X"), "X2": ("X", "2"), "12": ("1", "2")}[scelta]
+                q_b, appr = 1 / (1 / qs[a_] + 1 / qs[b_]), "circa "
+            ev = (p_sc * q_b - 1) * 100
+            riga_q += f"Il bookmaker paga {appr}{q_b:.2f}: ogni 100 € giocati ne tornano in media {100 + ev:.0f} €. "
+            riga_q += ("Con le quote reali il modello coincide con il mercato: il costo è il margine del bookmaker, non c'è un vantaggio da cercare."
+                       if d["ancorata"] else "Il vantaggio, se c'è, è solo sulla carta: il modello non ha dimostrato di battere le quote.")
+        else:
+            riga_q += "Giocala solo se la trovi a questa quota o più alta: sotto, ti costa."
+        righe.append(riga_q)
+    outsider = [("il 1" if k == "1" else "il 2") + f" al {pp[k] * 100:.0f}%" for k in ("1", "2") if pp[k] < 0.25]
+    righe.append("**⛔ Evita:** gli outsider" + (f" (qui {', '.join(outsider)})" if outsider else "") +
+                 ", i multigol, i risultati esatti e le combo: nei nostri test le quote alte sugli outsider hanno reso peggio e questi mercati hanno margini più alti.")
     if note:
-        righe.append("Nota: " + "; ".join(note) + ".")
-    if d["ancorata"]:
-        pg, po = mg["btts"], mg["over2.5"]
-        extra = []
-        for nome_, pv, ch in (("Goal" if pg >= 0.5 else "No Goal", max(pg, 1 - pg), "goal"), ("Over 2.5" if po >= 0.5 else "Under 2.5", max(po, 1 - po), "ou")):
-            fz = cerca_fiducia(curve.get(ch) if curve else None, pv)
-            if fz and fz[0] >= 0.65:
-                extra.append(f"{nome_} ({fz[0] * 100:.0f}% nei backtest)")
-        righe.append("Altri mercati: " + (", ".join(extra) if extra else "nessuna indicazione abbastanza solida (servono almeno il 65% nei backtest)") + ".")
-    else:
-        righe.append("Goal/No Goal e Over/Under: senza le quote sono vicini alla media del campionato, non ti do un'indicazione.")
+        righe.append("**Nota:** " + "; ".join(note) + ".")
     righe.append("_Il modello non batte le quote: la fiducia dice quante volte esce, non se conviene giocarla._")
     return livello, "\n\n".join(righe)
 
@@ -1819,6 +2019,12 @@ except Exception:
 st.sidebar.markdown("### ⚙ Configurazione API")
 chiave_api = st.sidebar.text_input("🔑 API Key football-data.org (facoltativa)", value=_chiave_default, type="password")
 st.sidebar.caption("Con la chiave il calendario mostra tutte le giornate. Senza, mostra le partite giocate e il prossimo turno.")
+try:
+    _chiave_apif = st.secrets.get("API_FOOTBALL_KEY", "")
+except Exception:
+    _chiave_apif = ""
+chiave_apif = st.sidebar.text_input("🔑 API Key API-Football (facoltativa)", value=_chiave_apif, type="password")
+st.sidebar.caption("Serve per le quote e il calendario delle coppe: la verifica è nella scheda 🌍 Coppe. La chiave non viene salvata.")
 st.sidebar.markdown("---")
 st.sidebar.info("💡 Il modello sceglie da solo i propri parametri (nessuna impostazione da fare). Da cellulare puoi cambiare campionato dal menu in alto.")
 
@@ -1927,155 +2133,165 @@ def mostra_analisi(casa, trasf, data, ora):
         unsafe_allow_html=True,
     )
     curve_v = pesi.get("curve", {}).get("con" if d["ancorata"] else "senza")
-    liv_v, testo_v = verdetto_partita(pr, mg, d, curve_v, casa not in modello["idx"] or trasf not in modello["idx"])
+    gl_c, gl_t = gol_attesi(d["M_gol"])
+    liv_v, testo_v = scheda_semplice(casa, trasf, pr, d, curve_v, casa not in modello["idx"] or trasf not in modello["idx"],
+                                     quote_grezze_partita(casa, trasf), gl_c, gl_t, sum(gol_attesi(M_freq_live)))
     {"alta": st.success, "media": st.info, "bassa": st.warning}[liv_v](testo_v)
-    pp = pr["p"]
-    st.markdown("#### 🎯 Il pronostico")
-    r1, r2, r3, r4 = st.columns(4)
-    dx = (pp[pr["pronostico"]] - pp["X"]) * 100
-    gap12 = abs(pp["1"] - pp["2"]) * 100
-    equilibrata = pr["pronostico"] != "X" and gap12 <= 8 and pp["X"] >= 0.25
-    r1.metric("Pronostico 1X2", NOMI_ESITO[pr["pronostico"]], f"{pp[pr['pronostico']]*100:.1f}%" + (" · partita equilibrata" if equilibrata else "") + (" · X scelta dalla soglia del backtest" if pr["x_regola"] else ""), delta_color="off")
-    r2.metric("Doppia chance più probabile", pr["doppia_best"], f"{pp[pr['doppia_best']]*100:.1f}%", delta_color="off")
-    cg = pr["combo_goal"].iloc[0]
-    r3.metric("Combo più probabile (1X2 + Goal)", cg["Mercato"], f"{cg['Probabilità %']:.1f}%", delta_color="off")
-    r4.metric("Multigol più probabile (3 gol)", pr["multigol_best"] + " gol", f"{pr['multigol_best_p']*100:.1f}%", delta_color="off")
-    if equilibrata:
-        st.info(f"⚖️ Partita equilibrata: 1 e 2 sono a {gap12:.1f} punti e la X vale {pp['X']*100:.1f}% (a {dx:.1f} punti dal pronostico). "
-                f"Il pareggio qui è un esito molto concreto: nel campionato esce circa il {freq_combo['X']*100:.0f}% delle volte e di più nelle partite equilibrate "
-                "(nei backtest circa il 30%). Un solo esito resta più probabile, ma 1X / X2 coprono bene il pareggio.")
-    s1, s2, s3 = st.columns(3)
-    cs = pr["combo_goal"].sort_values("Differenza (punti)", ascending=False).iloc[0]
-    s1.metric("Più sopra la media (1X2 + Goal)", cs["Mercato"], f"{cs['Differenza (punti)']:+.1f} punti rispetto alla media storica", delta_color="off")
-    co1 = pr["combo_ou"].iloc[0]
-    s2.metric("Combo più probabile (1X2 + Over/Under 2.5)", co1["Mercato"], f"{co1['Probabilità %']:.1f}%", delta_color="off")
-    cs2 = pr["combo_ou"].sort_values("Differenza (punti)", ascending=False).iloc[0]
-    s3.metric("Più sopra la media (1X2 + Over/Under 2.5)", cs2["Mercato"], f"{cs2['Differenza (punti)']:+.1f} punti rispetto alla media storica", delta_color="off")
-    k1_, k2_, k3_ = st.columns(3)
-    c25 = lambda df_: df_[df_["Mercato"].str.contains("2.5")].iloc[0]
-    kd = c25(pr["combo_doppie_ou"])
-    kg = c25(pr["combo_goal_ou"])
-    kdg = pr["combo_doppie_goal"].iloc[0]
-    k1_.metric("Doppia chance + Over/Under 2.5 più probabile", kd["Mercato"], f"{kd['Probabilità %']:.1f}%", delta_color="off")
-    k2_.metric("Goal + Over/Under 2.5 più probabile", kg["Mercato"], f"{kg['Probabilità %']:.1f}%", delta_color="off")
-    k3_.metric("Doppia chance + Goal più probabile", kdg["Mercato"], f"{kdg['Probabilità %']:.1f}%", delta_color="off")
-    st.caption(f"Fonte Goal / Over-Under / Risultati esatti: {d['fonte']}.")
-    if not d["ancorata"]:
-        st.warning("⚠ Senza le quote del bookmaker, Goal/No Goal e Over/Under hanno poco potere predittivo: nel backtest su circa 1200 partite "
-                   "non hanno battuto in modo netto le semplici frequenze storiche. Considerali indicativi, vicini alla media del campionato.")
-    col_sq, col_st = st.columns([1.2, 1.8])
-    with col_sq:
-        st.markdown(
-            f"""
-            <div style="text-align: center; padding: 30px 20px; background: rgba(15, 23, 42, 0.6); border-radius: 14px; border: 1px solid #1e293b;">
-                <h2 style="color: #38bdf8; margin: 0; font-size: 1.4rem;">{casa}</h2>
-                <p style="color: #64748b; margin: 5px 0 20px 0; font-size: 0.85rem;">CASA</p>
-                <h3 style="color: #a855f7; margin: 0; font-size: 1.2rem;">VS</h3>
-                <h2 style="color: #f43f5e; margin: 20px 0 0 0; font-size: 1.4rem;">{trasf}</h2>
-                <p style="color: #64748b; margin: 5px 0 0 0; font-size: 0.85rem;">TRASFERTA</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with col_st:
-        st.markdown("<p style='text-align: center; font-weight: 700; color: #94a3b8; margin-bottom: 15px; letter-spacing: 0.5px;'>STATISTICHE ATTESE (MEDIE STORICHE REALI)</p>", unsafe_allow_html=True)
-        righe_st = {"Gol Attesi": (round(lh, 2), round(la, 2))}
-        righe_st.update(stats_attese(df_storico, casa, trasf))
-        for label, (vc, vt) in righe_st.items():
+    cf_righe = chi_fa_di_piu(df_storico, casa, trasf, parametri_chi_fa_di_piu(div, giorno))
+    if cf_righe:
+        st.markdown("#### ⚔️ Chi farà di più")
+        st.dataframe(pd.DataFrame(cf_righe), use_container_width=True, hide_index=True)
+        st.caption("Medie storiche reali delle due squadre (in casa o in trasferta e subite dall'avversario), con il pareggio possibile. Non ci sono quote su questi mercati: sono indicazioni, non valore. "
+                   "'Affidabilità' dice se nel test a ritroso il modello ha battuto le sole frequenze; se non le batte non do un pronostico.")
+    with st.expander("🎯 Tutti i pronostici e le combo", expanded=False):
+        pp = pr["p"]
+        st.markdown("#### 🎯 Il pronostico")
+        r1, r2, r3, r4 = st.columns(4)
+        dx = (pp[pr["pronostico"]] - pp["X"]) * 100
+        gap12 = abs(pp["1"] - pp["2"]) * 100
+        equilibrata = pr["pronostico"] != "X" and gap12 <= 8 and pp["X"] >= 0.25
+        r1.metric("Pronostico 1X2", NOMI_ESITO[pr["pronostico"]], f"{pp[pr['pronostico']]*100:.1f}%" + (" · partita equilibrata" if equilibrata else "") + (" · X scelta dalla soglia del backtest" if pr["x_regola"] else ""), delta_color="off")
+        r2.metric("Doppia chance più probabile", pr["doppia_best"], f"{pp[pr['doppia_best']]*100:.1f}%", delta_color="off")
+        cg = pr["combo_goal"].iloc[0]
+        r3.metric("Combo più probabile (1X2 + Goal)", cg["Mercato"], f"{cg['Probabilità %']:.1f}%", delta_color="off")
+        r4.metric("Multigol più probabile (3 gol)", pr["multigol_best"] + " gol", f"{pr['multigol_best_p']*100:.1f}%", delta_color="off")
+        if equilibrata:
+            st.info(f"⚖️ Partita equilibrata: 1 e 2 sono a {gap12:.1f} punti e la X vale {pp['X']*100:.1f}% (a {dx:.1f} punti dal pronostico). "
+                    f"Il pareggio qui è un esito molto concreto: nel campionato esce circa il {freq_combo['X']*100:.0f}% delle volte e di più nelle partite equilibrate "
+                    "(nei backtest circa il 30%). Un solo esito resta più probabile, ma 1X / X2 coprono bene il pareggio.")
+        s1, s2, s3 = st.columns(3)
+        cs = pr["combo_goal"].sort_values("Differenza (punti)", ascending=False).iloc[0]
+        s1.metric("Più sopra la media (1X2 + Goal)", cs["Mercato"], f"{cs['Differenza (punti)']:+.1f} punti rispetto alla media storica", delta_color="off")
+        co1 = pr["combo_ou"].iloc[0]
+        s2.metric("Combo più probabile (1X2 + Over/Under 2.5)", co1["Mercato"], f"{co1['Probabilità %']:.1f}%", delta_color="off")
+        cs2 = pr["combo_ou"].sort_values("Differenza (punti)", ascending=False).iloc[0]
+        s3.metric("Più sopra la media (1X2 + Over/Under 2.5)", cs2["Mercato"], f"{cs2['Differenza (punti)']:+.1f} punti rispetto alla media storica", delta_color="off")
+        k1_, k2_, k3_ = st.columns(3)
+        c25 = lambda df_: df_[df_["Mercato"].str.contains("2.5")].iloc[0]
+        kd = c25(pr["combo_doppie_ou"])
+        kg = c25(pr["combo_goal_ou"])
+        kdg = pr["combo_doppie_goal"].iloc[0]
+        k1_.metric("Doppia chance + Over/Under 2.5 più probabile", kd["Mercato"], f"{kd['Probabilità %']:.1f}%", delta_color="off")
+        k2_.metric("Goal + Over/Under 2.5 più probabile", kg["Mercato"], f"{kg['Probabilità %']:.1f}%", delta_color="off")
+        k3_.metric("Doppia chance + Goal più probabile", kdg["Mercato"], f"{kdg['Probabilità %']:.1f}%", delta_color="off")
+        st.caption(f"Fonte Goal / Over-Under / Risultati esatti: {d['fonte']}.")
+        if not d["ancorata"]:
+            st.warning("⚠ Senza le quote del bookmaker, Goal/No Goal e Over/Under hanno poco potere predittivo: nel backtest su circa 1200 partite "
+                       "non hanno battuto in modo netto le semplici frequenze storiche. Considerali indicativi, vicini alla media del campionato.")
+    with st.expander("📊 Analisi completa: squadre, mercati, tempi, multigol", expanded=False):
+        col_sq, col_st = st.columns([1.2, 1.8])
+        with col_sq:
             st.markdown(
                 f"""
-                <div style="display: flex; justify-content: space-between; align-items: center; background: #111827; padding: 12px 18px; border-radius: 10px; border: 1px solid #1f2937; margin-bottom: 10px;">
-                    <span style="font-weight: 700; color: #38bdf8; font-size: 1.1rem; width: 60px; text-align: left;">{vc}</span>
-                    <span style="color: #94a3b8; font-size: 0.9rem; font-weight: 600; text-align: center; flex-grow: 1;">{label}</span>
-                    <span style="font-weight: 700; color: #f43f5e; font-size: 1.1rem; width: 60px; text-align: right;">{vt}</span>
+                <div style="text-align: center; padding: 30px 20px; background: rgba(15, 23, 42, 0.6); border-radius: 14px; border: 1px solid #1e293b;">
+                    <h2 style="color: #38bdf8; margin: 0; font-size: 1.4rem;">{casa}</h2>
+                    <p style="color: #64748b; margin: 5px 0 20px 0; font-size: 0.85rem;">CASA</p>
+                    <h3 style="color: #a855f7; margin: 0; font-size: 1.2rem;">VS</h3>
+                    <h2 style="color: #f43f5e; margin: 20px 0 0 0; font-size: 1.4rem;">{trasf}</h2>
+                    <p style="color: #64748b; margin: 5px 0 0 0; font-size: 0.85rem;">TRASFERTA</p>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
-    st.markdown(f"<h3>🔬 Analisi Poisson / Dixon-Coles & Mercati: {casa} vs {trasf}</h3>", unsafe_allow_html=True)
-    curve_ = pesi.get("curve", {}).get("con" if d["ancorata"] else "senza")
-    st.markdown("#### 📏 Quanto fidarsi di queste percentuali")
-    pg_ = mg["btts"]
-    side_g = ("Goal", pg_) if pg_ >= 0.5 else ("No Goal", 1 - pg_)
-    po_ = mg["over2.5"]
-    side_o = ("Over 2.5", po_) if po_ >= 0.5 else ("Under 2.5", 1 - po_)
-    voci = [("Pronostico 1X2: " + NOMI_ESITO[pr["pronostico"]], pp[pr["pronostico"]], "1x2"),
-            ("Doppia chance " + pr["doppia_best"], pp[pr["doppia_best"]], "doppia"),
-            ("Doppia chance con la X: " + pr["doppia_x_best"], pp[pr["doppia_x_best"]], "doppia"),
-            (side_g[0], side_g[1], "goal"), (side_o[0], side_o[1], "ou")]
-    righe_f = []
-    for nome_v, pv, chiave in voci:
-        f_ = cerca_fiducia(curve_.get(chiave) if curve_ else None, pv)
-        righe_f.append({"Mercato": nome_v, "Previsto %": round(pv * 100, 1),
-                        "Nei backtest è uscito %": round(f_[0] * 100, 1) if f_ else None, "Casi simili": f_[1] if f_ else None})
-    st.dataframe(pd.DataFrame(righe_f), use_container_width=True, hide_index=True)
-    st.caption("Tra le partite del backtest in cui l'app dava una percentuale simile, quante volte è davvero uscito. Un 70% previsto è uscito circa 7 volte su 10: "
-               "anche la percentuale più alta perde spesso. Se i casi simili sono pochi o mancano, la percentuale è poco verificata.")
-    u1_, u2_, u3_ = st.columns(3)
-    u1_.metric("Doppia chance con la X più probabile", pr["doppia_x_best"], f"{pp[pr['doppia_x_best']]*100:.1f}%", delta_color="off")
-    u2_.metric("Multigol casa più sopra la media (2 gol)", ps["casa_best"] + " gol", _testo_multigol(ps["casa_best_p"], ps["casa_best_f"]), delta_color="off")
-    u3_.metric("Multigol trasferta più sopra la media (2 gol)", ps["trasf_best"] + " gol", _testo_multigol(ps["trasf_best_p"], ps["trasf_best_f"]), delta_color="off")
-    v1_, v2_, v3_ = st.columns(3)
-    v1_.metric("Multigol 1° tempo più sopra la media (2 gol)", pt["t1_best"] + " gol", _testo_multigol(pt["t1_best_p"], pt["t1_best_f"]), delta_color="off")
-    v2_.metric("Multigol 2° tempo più sopra la media (2 gol)", pt["t2_best"] + " gol", _testo_multigol(pt["t2_best_p"], pt["t2_best_f"]), delta_color="off")
-    v3_.metric("Tempo con più gol", pt["piu_best"], f"{pt['piu_best_p']*100:.1f}%", delta_color="off")
-    st.caption("Multigol da 2 gol (0-1, 1-2, 2-3): la finestra mostrata è quella in cui il modello sta più sopra la media storica del campionato, "
-               "non la più probabile in assoluto, che sarebbe quasi sempre la stessa. Sopra la media non significa valore: non c'è una quota con cui confrontarla. "
-               "Nelle tabelle in basso trovi tutte le finestre e le percentuali di 0, 1 e 2+ gol con la media accanto.")
-    gap = abs(pp["1"] - pp["2"]) * 100
-    st.caption(f"La X vale {pp['X']*100:.1f}% (media storica del campionato: {freq_combo['X']*100:.1f}%) e la differenza tra 1 e 2 è di {gap:.1f} punti. "
-               "La X è quasi mai l'esito singolo più probabile, anche con le quote del mercato: nelle partite equilibrate guarda la doppia chance. "
-               "'Più sopra la media' mostra dove il modello vede qualcosa di diverso dal solito, mentre 'più probabile' dice soprattutto chi è la favorita. "
-               "Nel Backtest, sezioni 'Il pareggio' e 'Calibrazione Goal', trovi se il modello sbaglia sistematicamente.")
-    a1, a2, a3 = st.columns(3)
-    a1.metric("Segno 1 (Casa)", f"{mk['p1']*100:.1f}%", f"Quota equa: {1/mk['p1']:.2f}")
-    a2.metric("Segno X (Pareggio)", f"{mk['px']*100:.1f}%", f"Quota equa: {1/mk['px']:.2f}")
-    a3.metric("Segno 2 (Trasferta)", f"{mk['p2']*100:.1f}%", f"Quota equa: {1/mk['p2']:.2f}")
-    st.markdown("#### ⚽ Analisi Under / Over & Goal / No Goal")
-    u1, u2, u3, u4, u5 = st.columns(5)
-    u1.metric("Over 2.5", f"{mg['over2.5']*100:.1f}%", f"Under: {(1-mg['over2.5'])*100:.1f}%")
-    u2.metric("Over 1.5", f"{mg['over1.5']*100:.1f}%", f"Under: {(1-mg['over1.5'])*100:.1f}%")
-    u3.metric("Over 3.5", f"{mg['over3.5']*100:.1f}%", f"Under: {(1-mg['over3.5'])*100:.1f}%")
-    u4.metric("Goal (BTTS)", f"{mg['btts']*100:.1f}%", f"Quota: {1/mg['btts']:.2f}")
-    u5.metric("No Goal", f"{(1-mg['btts'])*100:.1f}%", f"Quota: {1/(1-mg['btts']):.2f}")
-    st.markdown("#### 🎯 Top 3 Risultati Esatti più Probabili")
-    flat = sorted(((i, j, M[i, j]) for i in range(M.shape[0]) for j in range(M.shape[1])), key=lambda t: t[2], reverse=True)[:3]
-    for col, medaglia, nome, (i, j, p) in zip(st.columns(3), ["🥇", "🥈", "🥉"], ["1°", "2°", "3°"], flat):
-        col.info(f"{medaglia} {nome} Esatto: **{i} - {j}** ({p*100:.1f}%)")
-    st.markdown("#### 🛡️ Doppia chance")
-    st.dataframe(pr["doppie"], use_container_width=True, hide_index=True)
-    st.markdown("#### 🔗 Combo")
-    ct1, ct2, ct3, ct4, ct5 = st.tabs(["1X2 + Goal", "1X2 + Over/Under", "Doppia chance + Goal", "Doppia chance + Over/Under", "Goal + Over/Under"])
-    ct1.dataframe(pr["combo_goal"], use_container_width=True, hide_index=True)
-    ct2.dataframe(pr["combo_ou_linee"], use_container_width=True, hide_index=True)
-    ct3.dataframe(pr["combo_doppie_goal"], use_container_width=True, hide_index=True)
-    ct4.dataframe(pr["combo_doppie_ou"], use_container_width=True, hide_index=True)
-    ct5.dataframe(pr["combo_goal_ou"], use_container_width=True, hide_index=True)
-    st.caption("Over/Under sulle linee 1.5, 2.5 e 3.5. Le righe sono ordinate per probabilità: le combo con 'Over 1.5' o 'Under 3.5' sono quasi sempre in cima perché sono molto probabili, "
-               "ma pagano poco. La colonna 'Differenza' dice dove il modello si discosta dalla media storica.")
-    st.markdown("#### 🎰 Multigol totale")
-    st.dataframe(pr["multigol_tot"], use_container_width=True, hide_index=True)
-    st.markdown("#### 👥 Gol e multigol delle due squadre")
-    mm1, mm2 = st.columns(2)
-    mm1.markdown(f"**{casa}**")
-    mm1.dataframe(ps["casa"], use_container_width=True, hide_index=True)
-    mm2.markdown(f"**{trasf}**")
-    mm2.dataframe(ps["trasf"], use_container_width=True, hide_index=True)
-    st.markdown("#### 🕐 Primo e secondo tempo")
-    tt1, tt2 = st.columns(2)
-    tt1.markdown("**1° tempo**")
-    tt1.dataframe(pt["t1"], use_container_width=True, hide_index=True)
-    tt2.markdown("**2° tempo**")
-    tt2.dataframe(pt["t2"], use_container_width=True, hide_index=True)
-    st.markdown("**Quale tempo ha più gol**")
-    st.dataframe(pt["piu_gol"], use_container_width=True, hide_index=True)
-    st.caption(f"Combo, multigol e tempi sono calcolati dalla stessa distribuzione dei punteggi (1X2 come mostrato sopra, gol secondo la fonte indicata). "
-               f"I tempi usano il totale dei gol della partita e come i gol si sono divisi davvero tra primo e secondo tempo nello storico del campionato "
-               f"(circa il {quota_pt[0]*100:.0f}% dei gol in casa e il {quota_pt[1]*100:.0f}% in trasferta arriva nel 1° tempo): è un'approssimazione, verificata nel Backtest. Un multigol più largo è sempre più probabile ma paga meno: confronta la quota equa con quella offerta.")
-    if d["ancorata"]:
-        st.caption("Con le quote reali le probabilità 1X2 coincidono con quelle del mercato (senza margine): non c'è edge da cercare qui.")
-    if casa not in modello["idx"] or trasf not in modello["idx"]:
-        st.caption("⚠ Una delle due squadre non ha storico (es. neopromossa): è trattata come squadra media.")
+        with col_st:
+            st.markdown("<p style='text-align: center; font-weight: 700; color: #94a3b8; margin-bottom: 15px; letter-spacing: 0.5px;'>STATISTICHE ATTESE (MEDIE STORICHE REALI)</p>", unsafe_allow_html=True)
+            righe_st = {"Gol Attesi": (round(lh, 2), round(la, 2))}
+            righe_st.update(stats_attese(df_storico, casa, trasf))
+            for label, (vc, vt) in righe_st.items():
+                st.markdown(
+                    f"""
+                    <div style="display: flex; justify-content: space-between; align-items: center; background: #111827; padding: 12px 18px; border-radius: 10px; border: 1px solid #1f2937; margin-bottom: 10px;">
+                        <span style="font-weight: 700; color: #38bdf8; font-size: 1.1rem; width: 60px; text-align: left;">{vc}</span>
+                        <span style="color: #94a3b8; font-size: 0.9rem; font-weight: 600; text-align: center; flex-grow: 1;">{label}</span>
+                        <span style="font-weight: 700; color: #f43f5e; font-size: 1.1rem; width: 60px; text-align: right;">{vt}</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+        st.markdown(f"<h3>🔬 Analisi Poisson / Dixon-Coles & Mercati: {casa} vs {trasf}</h3>", unsafe_allow_html=True)
+        curve_ = pesi.get("curve", {}).get("con" if d["ancorata"] else "senza")
+        st.markdown("#### 📏 Quanto fidarsi di queste percentuali")
+        pg_ = mg["btts"]
+        side_g = ("Goal", pg_) if pg_ >= 0.5 else ("No Goal", 1 - pg_)
+        po_ = mg["over2.5"]
+        side_o = ("Over 2.5", po_) if po_ >= 0.5 else ("Under 2.5", 1 - po_)
+        voci = [("Pronostico 1X2: " + NOMI_ESITO[pr["pronostico"]], pp[pr["pronostico"]], "1x2"),
+                ("Doppia chance " + pr["doppia_best"], pp[pr["doppia_best"]], "doppia"),
+                ("Doppia chance con la X: " + pr["doppia_x_best"], pp[pr["doppia_x_best"]], "doppia"),
+                (side_g[0], side_g[1], "goal"), (side_o[0], side_o[1], "ou")]
+        righe_f = []
+        for nome_v, pv, chiave in voci:
+            f_ = cerca_fiducia(curve_.get(chiave) if curve_ else None, pv)
+            righe_f.append({"Mercato": nome_v, "Previsto %": round(pv * 100, 1),
+                            "Nei backtest è uscito %": round(f_[0] * 100, 1) if f_ else None, "Casi simili": f_[1] if f_ else None})
+        st.dataframe(pd.DataFrame(righe_f), use_container_width=True, hide_index=True)
+        st.caption("Tra le partite del backtest in cui l'app dava una percentuale simile, quante volte è davvero uscito. Un 70% previsto è uscito circa 7 volte su 10: "
+                   "anche la percentuale più alta perde spesso. Se i casi simili sono pochi o mancano, la percentuale è poco verificata.")
+        u1_, u2_, u3_ = st.columns(3)
+        u1_.metric("Doppia chance con la X più probabile", pr["doppia_x_best"], f"{pp[pr['doppia_x_best']]*100:.1f}%", delta_color="off")
+        u2_.metric("Multigol casa più sopra la media (2 gol)", ps["casa_best"] + " gol", _testo_multigol(ps["casa_best_p"], ps["casa_best_f"]), delta_color="off")
+        u3_.metric("Multigol trasferta più sopra la media (2 gol)", ps["trasf_best"] + " gol", _testo_multigol(ps["trasf_best_p"], ps["trasf_best_f"]), delta_color="off")
+        v1_, v2_, v3_ = st.columns(3)
+        v1_.metric("Multigol 1° tempo più sopra la media (2 gol)", pt["t1_best"] + " gol", _testo_multigol(pt["t1_best_p"], pt["t1_best_f"]), delta_color="off")
+        v2_.metric("Multigol 2° tempo più sopra la media (2 gol)", pt["t2_best"] + " gol", _testo_multigol(pt["t2_best_p"], pt["t2_best_f"]), delta_color="off")
+        v3_.metric("Tempo con più gol", pt["piu_best"], f"{pt['piu_best_p']*100:.1f}%", delta_color="off")
+        st.caption("Multigol da 2 gol (0-1, 1-2, 2-3): la finestra mostrata è quella in cui il modello sta più sopra la media storica del campionato, "
+                   "non la più probabile in assoluto, che sarebbe quasi sempre la stessa. Sopra la media non significa valore: non c'è una quota con cui confrontarla. "
+                   "Nelle tabelle in basso trovi tutte le finestre e le percentuali di 0, 1 e 2+ gol con la media accanto.")
+        gap = abs(pp["1"] - pp["2"]) * 100
+        st.caption(f"La X vale {pp['X']*100:.1f}% (media storica del campionato: {freq_combo['X']*100:.1f}%) e la differenza tra 1 e 2 è di {gap:.1f} punti. "
+                   "La X è quasi mai l'esito singolo più probabile, anche con le quote del mercato: nelle partite equilibrate guarda la doppia chance. "
+                   "'Più sopra la media' mostra dove il modello vede qualcosa di diverso dal solito, mentre 'più probabile' dice soprattutto chi è la favorita. "
+                   "Nel Backtest, sezioni 'Il pareggio' e 'Calibrazione Goal', trovi se il modello sbaglia sistematicamente.")
+        a1, a2, a3 = st.columns(3)
+        a1.metric("Segno 1 (Casa)", f"{mk['p1']*100:.1f}%", f"Quota equa: {1/mk['p1']:.2f}")
+        a2.metric("Segno X (Pareggio)", f"{mk['px']*100:.1f}%", f"Quota equa: {1/mk['px']:.2f}")
+        a3.metric("Segno 2 (Trasferta)", f"{mk['p2']*100:.1f}%", f"Quota equa: {1/mk['p2']:.2f}")
+        st.markdown("#### ⚽ Analisi Under / Over & Goal / No Goal")
+        u1, u2, u3, u4, u5 = st.columns(5)
+        u1.metric("Over 2.5", f"{mg['over2.5']*100:.1f}%", f"Under: {(1-mg['over2.5'])*100:.1f}%")
+        u2.metric("Over 1.5", f"{mg['over1.5']*100:.1f}%", f"Under: {(1-mg['over1.5'])*100:.1f}%")
+        u3.metric("Over 3.5", f"{mg['over3.5']*100:.1f}%", f"Under: {(1-mg['over3.5'])*100:.1f}%")
+        u4.metric("Goal (BTTS)", f"{mg['btts']*100:.1f}%", f"Quota: {1/mg['btts']:.2f}")
+        u5.metric("No Goal", f"{(1-mg['btts'])*100:.1f}%", f"Quota: {1/(1-mg['btts']):.2f}")
+        st.markdown("#### 🎯 Top 3 Risultati Esatti più Probabili")
+        flat = sorted(((i, j, M[i, j]) for i in range(M.shape[0]) for j in range(M.shape[1])), key=lambda t: t[2], reverse=True)[:3]
+        for col, medaglia, nome, (i, j, p) in zip(st.columns(3), ["🥇", "🥈", "🥉"], ["1°", "2°", "3°"], flat):
+            col.info(f"{medaglia} {nome} Esatto: **{i} - {j}** ({p*100:.1f}%)")
+        st.markdown("#### 🛡️ Doppia chance")
+        st.dataframe(pr["doppie"], use_container_width=True, hide_index=True)
+        st.markdown("#### 🔗 Combo")
+        ct1, ct2, ct3, ct4, ct5 = st.tabs(["1X2 + Goal", "1X2 + Over/Under", "Doppia chance + Goal", "Doppia chance + Over/Under", "Goal + Over/Under"])
+        ct1.dataframe(pr["combo_goal"], use_container_width=True, hide_index=True)
+        ct2.dataframe(pr["combo_ou_linee"], use_container_width=True, hide_index=True)
+        ct3.dataframe(pr["combo_doppie_goal"], use_container_width=True, hide_index=True)
+        ct4.dataframe(pr["combo_doppie_ou"], use_container_width=True, hide_index=True)
+        ct5.dataframe(pr["combo_goal_ou"], use_container_width=True, hide_index=True)
+        st.caption("Over/Under sulle linee 1.5, 2.5 e 3.5. Le righe sono ordinate per probabilità: le combo con 'Over 1.5' o 'Under 3.5' sono quasi sempre in cima perché sono molto probabili, "
+                   "ma pagano poco. La colonna 'Differenza' dice dove il modello si discosta dalla media storica.")
+        st.markdown("#### 🎰 Multigol totale")
+        st.dataframe(pr["multigol_tot"], use_container_width=True, hide_index=True)
+        st.markdown("#### 👥 Gol e multigol delle due squadre")
+        mm1, mm2 = st.columns(2)
+        mm1.markdown(f"**{casa}**")
+        mm1.dataframe(ps["casa"], use_container_width=True, hide_index=True)
+        mm2.markdown(f"**{trasf}**")
+        mm2.dataframe(ps["trasf"], use_container_width=True, hide_index=True)
+        st.markdown("#### 🕐 Primo e secondo tempo")
+        tt1, tt2 = st.columns(2)
+        tt1.markdown("**1° tempo**")
+        tt1.dataframe(pt["t1"], use_container_width=True, hide_index=True)
+        tt2.markdown("**2° tempo**")
+        tt2.dataframe(pt["t2"], use_container_width=True, hide_index=True)
+        st.markdown("**Quale tempo ha più gol**")
+        st.dataframe(pt["piu_gol"], use_container_width=True, hide_index=True)
+        st.caption(f"Combo, multigol e tempi sono calcolati dalla stessa distribuzione dei punteggi (1X2 come mostrato sopra, gol secondo la fonte indicata). "
+                   f"I tempi usano il totale dei gol della partita e come i gol si sono divisi davvero tra primo e secondo tempo nello storico del campionato "
+                   f"(circa il {quota_pt[0]*100:.0f}% dei gol in casa e il {quota_pt[1]*100:.0f}% in trasferta arriva nel 1° tempo): è un'approssimazione, verificata nel Backtest. Un multigol più largo è sempre più probabile ma paga meno: confronta la quota equa con quella offerta.")
+        if d["ancorata"]:
+            st.caption("Con le quote reali le probabilità 1X2 coincidono con quelle del mercato (senza margine): non c'è edge da cercare qui.")
+        if casa not in modello["idx"] or trasf not in modello["idx"]:
+            st.caption("⚠ Una delle due squadre non ha storico (es. neopromossa): è trattata come squadra media.")
 
 
 # --- CALENDARIO ---
@@ -2417,7 +2633,7 @@ def esegui_test_campionato(div, giorno):
     if res is None:
         return None
     tab_a, tab_b, tab_c, tab_d, tab_e, best_ex, tab_cal, tab_roi, tab_tempi = tabelle_test(res, pesi_)
-    return {"tabelle": [tab_a, tab_cal, tab_tempi, tab_roi, tab_b, tab_c, tab_d, tab_e], "tempi_stagione": tabella_tempi_per_stagione(df), "punteggi_bassi": tabella_punteggi_bassi(res)}
+    return {"tabelle": [tab_a, tab_cal, tab_tempi, tab_roi, tab_b, tab_c, tab_d, tab_e], "tempi_stagione": tabella_tempi_per_stagione(df), "punteggi_bassi": tabella_punteggi_bassi(res), "chi_di_piu": test_chi_fa_di_piu(df)}
 
 
 def _cella_cal(cal, mercato, fonte, fascia):
@@ -2468,6 +2684,10 @@ def zip_test_campionati(risultati):
             pb_ = r.get("punteggi_bassi")
             if pb_ is not None and not pb_.empty:
                 z.writestr(f"{cartella}/10_punteggi_bassi.csv", "\ufeff" + pb_.to_csv(index=False))
+            ch_ = r.get("chi_di_piu")
+            if ch_ is not None:
+                z.writestr(f"{cartella}/11_chi_fa_di_piu_log_score.csv", "\ufeff" + ch_[0].to_csv(index=False))
+                z.writestr(f"{cartella}/12_chi_fa_di_piu_calibrazione.csv", "\ufeff" + ch_[1].to_csv(index=False))
     return buf.getvalue()
 
 
@@ -2676,6 +2896,20 @@ with tab_backtest:
         st.info("Per questo campionato mancano i dati dei tempi (HTHG/HTAG) o sono troppo pochi.")
     else:
         st.dataframe(_tab_ts, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.markdown("### ⚔️ Test: chi farà di più (tiri, tiri in porta, angoli, ammonizioni)")
+    st.caption("Per ogni partita le medie attese usano solo i giorni precedenti; si confronta il modello con le sole frequenze di 'casa di più', 'pari' e 'trasferta di più'. "
+               "Log score: più basso è meglio; differenza negativa = il modello è migliore.")
+    if st.button("⚔️ Esegui test 'chi farà di più'", key="test_chi"):
+        _df_chi = carica_storico(div, N_STAGIONI_TEST, giorno)
+        _out_chi = test_chi_fa_di_piu(_df_chi) if _df_chi is not None else None
+        if _out_chi is None:
+            st.warning("Dati insufficienti (mancano le colonne di tiri, angoli o cartellini, o ci sono poche partite).")
+        else:
+            st.dataframe(_out_chi[0], use_container_width=True, hide_index=True)
+            st.dataframe(_out_chi[1], use_container_width=True, hide_index=True)
+            st.caption("La seconda tabella confronta, per fasce, la probabilità del pronostico con quanto è uscito davvero.")
 
     st.markdown("---")
     st.markdown("### 🧊 Test su stagioni mai viste")
@@ -3044,12 +3278,111 @@ def test_coppe(df, passo=30):
     return pd.DataFrame(righe), pd.DataFrame(cal_righe), adatta_coppe(d), n
 
 
+API_FOOTBALL_LEGA = {"Champions League": 2, "Europa League": 3}  # codici di API-Football; il nome restituito dall'API conferma che sono giusti
+
+
+def api_football_get(chiave, percorso, params=None):
+    """Una chiamata a API-Football. Ritorna (json, intestazioni sui limiti, errore). La chiave non viene salvata né mostrata."""
+    try:
+        r = requests.get("https://v3.football.api-sports.io/" + percorso.lstrip("/"), headers={"x-apisports-key": chiave}, params=params or {}, timeout=20)
+    except Exception as e:
+        return None, {}, f"{type(e).__name__}: {e}"
+    lim = {k: v for k, v in r.headers.items() if k.lower().startswith("x-ratelimit")}
+    try:
+        js = r.json()
+    except Exception:
+        return None, lim, f"HTTP {r.status_code}: risposta non valida"
+    return js, lim, (None if r.status_code == 200 else f"HTTP {r.status_code}")
+
+
+def diagnosi_api_football(chiave, id_lega, anno):
+    """Verifica a basso costo (5 richieste): stato dell'account, copertura della competizione, prossime partite, quote di una partita e tipi di scommessa."""
+    out = {"errori": [], "stato": {}, "lega": {}, "copertura": {}, "partite": [], "bookmakers": [], "scommesse_partita": [], "tipi_scommessa": [], "log": []}
+
+    def passo(nome, percorso, params=None):
+        js, lim, err = api_football_get(chiave, percorso, params)
+        errs = js.get("errors") if isinstance(js, dict) else None
+        if errs:
+            out["errori"] += [f"{nome}: {k}: {v}" for k, v in (errs.items() if isinstance(errs, dict) else enumerate(errs))]
+        if err:
+            out["errori"].append(f"{nome}: {err}")
+        out["log"].append({"passo": nome, "percorso": percorso, "parametri": params or {}, "risultati": js.get("results") if isinstance(js, dict) else None, "limiti": lim})
+        return js if isinstance(js, dict) else {}
+
+    js = passo("stato", "status")
+    resp = js.get("response")
+    if isinstance(resp, dict):
+        out["stato"] = {"piano": (resp.get("subscription") or {}).get("plan"), "attivo": (resp.get("subscription") or {}).get("active"),
+                        "richieste_oggi": (resp.get("requests") or {}).get("current"), "limite_giornaliero": (resp.get("requests") or {}).get("limit_day")}
+    js = passo("copertura", "leagues", {"id": id_lega, "season": anno})
+    for it in (js.get("response") or [])[:1]:
+        out["lega"] = {"nome": (it.get("league") or {}).get("name"), "paese": (it.get("country") or {}).get("name")}
+        for sz in it.get("seasons") or []:
+            if sz.get("year") == anno:
+                out["copertura"] = {k: v for k, v in (sz.get("coverage") or {}).items() if not isinstance(v, dict)}
+                out["copertura"].update({f"fixtures.{k}": v for k, v in ((sz.get("coverage") or {}).get("fixtures") or {}).items()})
+    js = passo("prossime partite", "fixtures", {"league": id_lega, "season": anno, "next": 10})
+    ids = []
+    for it in js.get("response") or []:
+        fx_ = it.get("fixture") or {}
+        tm = it.get("teams") or {}
+        out["partite"].append({"id": fx_.get("id"), "data": fx_.get("date"), "casa": (tm.get("home") or {}).get("name"), "trasferta": (tm.get("away") or {}).get("name")})
+        ids.append(fx_.get("id"))
+    if ids:
+        js = passo("quote di una partita", "odds", {"fixture": ids[0]})
+        nomi = {}
+        for it in (js.get("response") or [])[:1]:
+            for bk in it.get("bookmakers") or []:
+                out["bookmakers"].append({"bookmaker": bk.get("name"), "tipi di scommessa": len(bk.get("bets") or [])})
+                for b in bk.get("bets") or []:
+                    nomi[b.get("name")] = nomi.get(b.get("name"), 0) + 1
+        out["scommesse_partita"] = [{"scommessa": k, "bookmaker che la offrono": v} for k, v in sorted(nomi.items(), key=lambda kv: -kv[1])]
+    js = passo("tipi di scommessa", "odds/bets")
+    out["tipi_scommessa"] = [b.get("name") for b in (js.get("response") or []) if b.get("name")]
+    return out
+
+
 # ======================= TAB COPPE EUROPEE =======================
 with tab_coppe:
     st.markdown("### 🌍 Coppe europee — solo previsione")
     st.caption("Dati gratuiti di openfootball (solo risultati: non ci sono quote storiche). La forza delle squadre viene dall'Elo; il modello stima da sole le partite di coppa "
                "quanti gol attendersi in base alla differenza di Elo. Non è confrontato col mercato: va letto come una stima, non come un valore.")
     coppa = st.selectbox("Competizione", list(COPPE.keys()), key="coppa_sel")
+    with st.expander("🔌 API-Football: verifica chiave, quote e calendario"):
+        if not chiave_apif:
+            st.info("Inserisci la chiave API-Football nella barra laterale (gratis su api-football.com, in Account → My Access).")
+        else:
+            st.caption("Fa 5 richieste (nel piano gratuito ne hai 100 al giorno): stato dell'account, copertura della competizione scelta, prossime partite, quote di una partita e tipi di scommessa. "
+                       "La chiave non viene salvata né mostrata, e non finisce nel file scaricabile.")
+            if st.button("🔌 Verifica chiave e copertura", key="apif_verifica"):
+                _oggi = date.today()
+                with st.spinner("Controllo in corso..."):
+                    dg = diagnosi_api_football(chiave_apif, API_FOOTBALL_LEGA[coppa], _oggi.year if _oggi.month >= 7 else _oggi.year - 1)
+                if dg["errori"]:
+                    st.warning("L'API ha risposto con questi avvisi (di solito dicono cosa non è incluso nel piano):\n\n" + "\n\n".join(f"- {e}" for e in dg["errori"]))
+                if dg["stato"]:
+                    st.write(f"**Account:** piano {dg['stato'].get('piano')}, richieste oggi {dg['stato'].get('richieste_oggi')} su {dg['stato'].get('limite_giornaliero')}.")
+                if dg["lega"]:
+                    st.write(f"**Competizione trovata:** {dg['lega'].get('nome')} ({dg['lega'].get('paese')}) — controlla che sia quella giusta.")
+                if dg["copertura"]:
+                    st.write("**Copertura della stagione in corso:**")
+                    st.dataframe(pd.DataFrame([{"Dato": k, "Disponibile": "sì" if v else "no"} for k, v in dg["copertura"].items()]), use_container_width=True, hide_index=True)
+                if dg["partite"]:
+                    st.write("**Prossime partite:**")
+                    st.dataframe(pd.DataFrame(dg["partite"]), use_container_width=True, hide_index=True)
+                else:
+                    st.caption("Nessuna partita futura restituita per questa stagione.")
+                if dg["bookmakers"]:
+                    st.write("**Quote della prima partita, per bookmaker:**")
+                    st.dataframe(pd.DataFrame(dg["bookmakers"]), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(dg["scommesse_partita"]), use_container_width=True, hide_index=True)
+                if dg["tipi_scommessa"]:
+                    _kw = ("both", "goal", "over", "under", "card", "scorer", "exact", "half", "double", "corner")
+                    with st.expander(f"Tutti i tipi di scommessa dell'API ({len(dg['tipi_scommessa'])})"):
+                        st.write(", ".join(dg["tipi_scommessa"]))
+                    st.caption("Tipi che ci interessano: " + ", ".join(t for t in dg["tipi_scommessa"] if any(k in t.lower() for k in _kw)))
+                st.download_button("⬇ Scarica la diagnosi (JSON, senza la chiave)", data=json.dumps(dg, indent=2, ensure_ascii=False, default=str),
+                                   file_name=f"diagnosi_api_football_{giorno}.json", mime="application/json", key="apif_dl")
     df_c, mancanti_c = carica_storico_coppa(coppa, giorno)
     if df_c is None:
         st.error("Non riesco a scaricare i dati delle coppe (openfootball). Riprova tra poco.")
