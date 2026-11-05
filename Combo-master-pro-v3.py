@@ -1630,6 +1630,8 @@ def _finestra_sopra_media(finestre, freq, nome):
 # Per ogni statistica: medie attese delle due squadre (stessa formula delle statistiche attese: casa/trasferta + subito dall'avversario, con shrinkage)
 # e due conteggi binomiali negativi indipendenti, da cui "casa di più", "pari" e "trasferta di più". Nessuna quota su questi mercati.
 CHI_STAT = [("Tiri", "HS", "AS"), ("Tiri in porta", "HST", "AST"), ("Corner", "HC", "AC"), ("Ammonizioni", "HY", "AY")]
+CHI_K = 5            # shrinkage verso la media del campionato (partite virtuali); il test di taratura confronta altri valori
+CHI_SCALA_PHI = 1.0  # fattore sulla sovradispersione stimata; il test di taratura confronta altri valori
 
 
 def _prob_piu_di(mu_h, mu_a, phi):
@@ -1647,7 +1649,18 @@ def _prob_piu_di(mu_h, mu_a, phi):
     return float(np.tril(M, -1).sum()), float(np.trace(M)), float(np.triu(M, 1).sum())
 
 
-def _medie_incrementali(df, h, a, k=5, min_lega=100):
+def _segno_chi(pc, pp_, pt):
+    """Segno 1/X/2 se un esito supera il 55%, altrimenti la doppia chance migliore se arriva almeno al 72%, altrimenti 'equilibrata'. Ritorna (segno, probabilità)."""
+    p = {"1": pc, "X": pp_, "2": pt}
+    top = max(p, key=p.get)
+    if p[top] >= 0.55:
+        return top, p[top]
+    dc = {"1X": pc + pp_, "X2": pp_ + pt, "12": pc + pt}
+    best = max(dc, key=dc.get)
+    return (best, dc[best]) if dc[best] >= 0.72 else (None, p[top])
+
+
+def _medie_incrementali(df, h, a, k=CHI_K, min_lega=100):
     """Per ogni partita, le medie attese (casa, trasferta) di una statistica calcolate solo con i giorni precedenti, e la sovradispersione stimata
     sui residui passati. Ritorna (df ordinato, mu_casa, mu_trasf, phi per partita, phi finale)."""
     d = df.sort_values("Date").reset_index(drop=True)
@@ -1699,9 +1712,10 @@ def _medie_incrementali(df, h, a, k=5, min_lega=100):
     return d, mu_h, mu_a, phi_r, phi
 
 
-def _perdite_chi(df, h, a):
-    """Walk-forward per una statistica: ritorna (perdite modello, perdite frequenze, probabilità n×3, esiti, phi finale) oppure None."""
-    d, mu_h, mu_a, phi, phi_fin = _medie_incrementali(df, h, a)
+def _perdite_chi(df, h, a, k=CHI_K, scala_phi=CHI_SCALA_PHI, pre=None):
+    """Walk-forward per una statistica: ritorna (perdite modello, perdite frequenze, probabilità n×3, esiti, phi finale) oppure None.
+    'pre' permette di riusare le medie già calcolate per lo stesso k (serve alla taratura)."""
+    d, mu_h, mu_a, phi, phi_fin = pre if pre is not None else _medie_incrementali(df, h, a, k=k)
     xh, xa = d[h].to_numpy(float), d[a].to_numpy(float)
     esito = np.where(xh > xa, 0, np.where(xh == xa, 1, 2))
     valido = ~(np.isnan(mu_h) | np.isnan(xh) | np.isnan(xa))
@@ -1709,7 +1723,7 @@ def _perdite_chi(df, h, a):
     Lm, Lf, P, E = [], [], [], []
     for r in range(len(d)):
         if valido[r]:
-            p3 = np.array(_prob_piu_di(mu_h[r], mu_a[r], phi[r]))
+            p3 = np.array(_prob_piu_di(mu_h[r], mu_a[r], phi[r] * scala_phi))
             Lm.append(-math.log(max(p3[esito[r]], 1e-9)))
             Lf.append(-math.log(cnt[esito[r]] / cnt.sum()))
             P.append(p3)
@@ -1723,7 +1737,7 @@ def _perdite_chi(df, h, a):
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def parametri_chi_fa_di_piu(div, giorno):
-    """Per ogni statistica: sovradispersione e z del test a ritroso contro le sole frequenze (negativo = il modello è meglio). Serve alla scheda partita."""
+    """Per ogni statistica: sovradispersione, differenza di log score dal test a ritroso contro le sole frequenze e il suo z (negativo = il modello è meglio)."""
     df = carica_storico(div, N_STAGIONI_TEST, giorno)
     out = {}
     if df is None:
@@ -1734,12 +1748,13 @@ def parametri_chi_fa_di_piu(div, giorno):
             if r is not None:
                 dd = r[0] - r[1]
                 se = dd.std(ddof=1) / math.sqrt(len(dd))
-                out[nome] = {"phi": float(r[4]), "z": float(dd.mean() / se) if se > 0 else 0.0}
+                out[nome] = {"phi": float(r[4]), "z": float(dd.mean() / se) if se > 0 else 0.0, "d": float(dd.mean())}
     return out
 
 
 def chi_fa_di_piu(df, casa, trasf, par):
-    """Righe per la scheda partita: chi avrà di più per tiri, tiri in porta, angoli e ammonizioni (con il pareggio), con l'affidabilità misurata nel test."""
+    """Righe per la scheda partita: chi avrà di più per tiri, tiri in porta, angoli e ammonizioni (con il pareggio). Se nel test a ritroso il modello non batte
+    le frequenze di almeno 0.02 di log score (z ≤ −2), le percentuali sono le frequenze storiche del campionato e lo dice."""
     righe = []
     for nome, h, a in CHI_STAT:
         if h not in df.columns or a not in df.columns or nome not in par:
@@ -1748,17 +1763,19 @@ def chi_fa_di_piu(df, casa, trasf, par):
         if len(d) < 100:
             continue
         lega_h, lega_a = d[h].mean(), d[a].mean()
-        sm = lambda serie, lega: (serie.sum() + 5 * lega) / (len(serie) + 5)
+        sm = lambda serie, lega: (serie.sum() + CHI_K * lega) / (len(serie) + CHI_K)
         dc, dt = d[d["HomeTeam"] == casa], d[d["AwayTeam"] == trasf]
         mh = (sm(dc[h], lega_h) + sm(dt[h], lega_h)) / 2
         ma = (sm(dt[a], lega_a) + sm(dc[a], lega_a)) / 2
-        pc, pp_, pt = _prob_piu_di(mh, ma, par[nome]["phi"])
-        z = par[nome]["z"]
-        top = max((pc, "Casa"), (pp_, "Pari"), (pt, "Trasferta"))
-        affid = "✅ meglio delle frequenze" if z <= -2 else ("❔ incerta" if z <= -1 else "⚠️ non batte le frequenze")
-        pron = "Equilibrata" if top[0] < 0.45 else f"{top[1]} ({top[0] * 100:.0f}%)"
+        ok_modello = par[nome]["z"] <= -2 and par[nome]["d"] <= -0.02
+        if ok_modello:
+            pc, pp_, pt = _prob_piu_di(mh, ma, par[nome]["phi"] * CHI_SCALA_PHI)
+        else:
+            pc, pp_, pt = float((d[h] > d[a]).mean()), float((d[h] == d[a]).mean()), float((d[h] < d[a]).mean())
+        segno, ps = _segno_chi(pc, pp_, pt)
         righe.append({"Statistica": nome, "Attesi (casa - trasf.)": f"{mh:.1f} - {ma:.1f}", "Casa di più %": round(pc * 100, 1), "Pari %": round(pp_ * 100, 1),
-                      "Trasferta di più %": round(pt * 100, 1), "Pronostico": pron if z <= -1 else "nessuna indicazione", "Affidabilità": affid})
+                      "Trasferta di più %": round(pt * 100, 1), "Segno": f"{segno} ({ps * 100:.0f}%)" if segno else "equilibrata",
+                      "Basato su": "✅ modello (batte le frequenze)" if ok_modello else "⚠️ solo frequenza storica del campionato", "_segno": segno, "_modello": ok_modello})
     return righe
 
 
@@ -1789,6 +1806,34 @@ def test_chi_fa_di_piu(df):
     if not righe:
         return None
     return pd.DataFrame(righe), pd.DataFrame(cal)
+
+
+def taratura_chi_fa_di_piu(df, ks=(2, 3, 5, 8), scale=(1.0, 0.7)):
+    """Confronta shrinkage (k) e fattore sulla sovradispersione. Ogni riga è confrontata con la configurazione attuale (k=5, fattore 1.0) con l'errore statistico,
+    e mostra pari e fascia 'oltre 65%' previsti e reali per vedere se la sottostima dei pronostici sicuri si riduce."""
+    righe = []
+    for nome, h, a in CHI_STAT:
+        if h not in df.columns or a not in df.columns:
+            continue
+        base = _perdite_chi(df, h, a, k=5, scala_phi=1.0)
+        if base is None:
+            continue
+        for k in ks:
+            pre = _medie_incrementali(df, h, a, k=k)
+            for sc in scale:
+                r = _perdite_chi(df, h, a, k=k, scala_phi=sc, pre=pre)
+                if r is None or len(r[0]) != len(base[0]):
+                    continue
+                Lm, Lf, pm, ac, _ = r
+                top, atteso = pm.max(axis=1), pm.argmax(axis=1)
+                m = top >= 0.65
+                righe.append({"Statistica": nome, "k": k, "Fattore dispersione": sc, "Partite": len(Lm), "Log score": round(float(Lm.mean()), 4),
+                              "Differenza dall'attuale (± err.)": _diff_se(Lm, base[0]),
+                              "Pari previsto %": round(float(pm[:, 1].mean()) * 100, 1), "Pari reale %": round(float((ac == 1).mean()) * 100, 1),
+                              "Oltre 65%: partite": int(m.sum()),
+                              "Oltre 65%: previsto %": round(float(top[m].mean()) * 100, 1) if m.sum() else None,
+                              "Oltre 65%: reale %": round(float((atteso[m] == ac[m]).mean()) * 100, 1) if m.sum() else None})
+    return pd.DataFrame(righe) if righe else None
 
 
 _NOMI_SCELTA = {"1": "1 (vince la casa)", "X": "X (pareggio)", "2": "2 (vince la trasferta)",
@@ -2140,9 +2185,10 @@ def mostra_analisi(casa, trasf, data, ora):
     cf_righe = chi_fa_di_piu(df_storico, casa, trasf, parametri_chi_fa_di_piu(div, giorno))
     if cf_righe:
         st.markdown("#### ⚔️ Chi farà di più")
-        st.dataframe(pd.DataFrame(cf_righe), use_container_width=True, hide_index=True)
-        st.caption("Medie storiche reali delle due squadre (in casa o in trasferta e subite dall'avversario), con il pareggio possibile. Non ci sono quote su questi mercati: sono indicazioni, non valore. "
-                   "'Affidabilità' dice se nel test a ritroso il modello ha battuto le sole frequenze; se non le batte non do un pronostico.")
+        st.markdown("**In breve:** " + " · ".join(f"{r['Statistica']} **{r['_segno'] or '—'}**" + ("" if r["_modello"] else " ⚠️") for r in cf_righe))
+        st.dataframe(pd.DataFrame(cf_righe).drop(columns=["_segno", "_modello"]), use_container_width=True, hide_index=True)
+        st.caption("1 = più la casa, X = pari, 2 = più la trasferta; 1X, X2 o 12 sono doppie chance quando nessun esito supera il 55%. Medie storiche reali delle due squadre (in casa o in trasferta e subite dall'avversario). "
+                   "Non ci sono quote su questi mercati: sono indicazioni, non valore. ⚠️ = nel test a ritroso il modello non batte abbastanza le sole frequenze, quindi uso la frequenza storica del campionato.")
     with st.expander("🎯 Tutti i pronostici e le combo", expanded=False):
         pp = pr["p"]
         st.markdown("#### 🎯 Il pronostico")
@@ -2633,7 +2679,7 @@ def esegui_test_campionato(div, giorno):
     if res is None:
         return None
     tab_a, tab_b, tab_c, tab_d, tab_e, best_ex, tab_cal, tab_roi, tab_tempi = tabelle_test(res, pesi_)
-    return {"tabelle": [tab_a, tab_cal, tab_tempi, tab_roi, tab_b, tab_c, tab_d, tab_e], "tempi_stagione": tabella_tempi_per_stagione(df), "punteggi_bassi": tabella_punteggi_bassi(res), "chi_di_piu": test_chi_fa_di_piu(df)}
+    return {"tabelle": [tab_a, tab_cal, tab_tempi, tab_roi, tab_b, tab_c, tab_d, tab_e], "tempi_stagione": tabella_tempi_per_stagione(df), "punteggi_bassi": tabella_punteggi_bassi(res), "chi_di_piu": test_chi_fa_di_piu(df), "taratura_chi": taratura_chi_fa_di_piu(df)}
 
 
 def _cella_cal(cal, mercato, fonte, fascia):
@@ -2688,6 +2734,9 @@ def zip_test_campionati(risultati):
             if ch_ is not None:
                 z.writestr(f"{cartella}/11_chi_fa_di_piu_log_score.csv", "\ufeff" + ch_[0].to_csv(index=False))
                 z.writestr(f"{cartella}/12_chi_fa_di_piu_calibrazione.csv", "\ufeff" + ch_[1].to_csv(index=False))
+            ta_ = r.get("taratura_chi")
+            if ta_ is not None:
+                z.writestr(f"{cartella}/13_taratura_chi_fa_di_piu.csv", "\ufeff" + ta_.to_csv(index=False))
     return buf.getvalue()
 
 
@@ -2910,6 +2959,15 @@ with tab_backtest:
             st.dataframe(_out_chi[0], use_container_width=True, hide_index=True)
             st.dataframe(_out_chi[1], use_container_width=True, hide_index=True)
             st.caption("La seconda tabella confronta, per fasce, la probabilità del pronostico con quanto è uscito davvero.")
+    if st.button("🎚️ Taratura 'chi farà di più' (shrinkage e dispersione)", key="tara_chi"):
+        _df_tara = carica_storico(div, N_STAGIONI_TEST, giorno)
+        _tara = taratura_chi_fa_di_piu(_df_tara) if _df_tara is not None else None
+        if _tara is None:
+            st.warning("Dati insufficienti per la taratura.")
+        else:
+            st.dataframe(_tara, use_container_width=True, hide_index=True)
+            st.caption("k = partite virtuali verso la media del campionato (attuale 5); fattore sulla dispersione (attuale 1.0). La differenza è dalla configurazione attuale: negativa = meglio. "
+                       "Regola fissata in anticipo: si adotta una variante solo se migliora di almeno 2 errori standard in almeno 5 campionati su 6.")
 
     st.markdown("---")
     st.markdown("### 🧊 Test su stagioni mai viste")
