@@ -17,7 +17,7 @@ import requests
 import streamlit as st
 from scipy.optimize import minimize, minimize_scalar
 from scipy.special import gammaln
-from scipy.stats import nbinom, poisson
+from scipy.stats import binom, nbinom, poisson
 
 # --- CONFIGURAZIONE PAGINA ---
 st.set_page_config(
@@ -1834,6 +1834,84 @@ def taratura_chi_fa_di_piu(df, ks=(1, 2, 3, 5), scale=(1.0, 0.7, 0.5)):
     return pd.DataFrame(righe) if righe else None
 
 
+# ======================= RISULTATO ESATTO DI OGNI TEMPO =======================
+# Dal punteggio finale (matrice dei punteggi) si ricava il punteggio di un tempo: ogni gol di casa o trasferta cade in quel tempo con la quota storica del campionato
+# (circa il 44% dei gol nel 1° tempo, da verificare sui dati). Nessuna quota storica su questo mercato: sono indicazioni, non valore.
+def distribuzione_tempo(M, f_casa, f_trasf):
+    """Distribuzione dei punteggi esatti di un tempo, dato il punteggio finale M e la quota di gol di casa e trasferta che arriva in quel tempo."""
+    n = M.shape[0]
+    k = np.arange(n)
+    Bc = binom.pmf(k[None, :], k[:, None], f_casa)
+    Bt = binom.pmf(k[None, :], k[:, None], f_trasf)
+    return Bc.T @ M @ Bt
+
+
+def esatti_per_tempo(M, df, quanti=3):
+    """I risultati esatti più probabili del 1° e del 2° tempo. La quota di gol per tempo viene dalla storia del campionato (None se mancano i dati dei tempi)."""
+    if df is None or "HTHG" not in df.columns or "HTAG" not in df.columns:
+        return None
+    d = df.dropna(subset=["HTHG", "HTAG"])
+    if len(d) < 100 or d["FTHG"].sum() == 0 or d["FTAG"].sum() == 0:
+        return None
+    fc, ft = float(d["HTHG"].sum() / d["FTHG"].sum()), float(d["HTAG"].sum() / d["FTAG"].sum())
+    righe = []
+    for nome, H in (("1° tempo", distribuzione_tempo(M, fc, ft)), ("2° tempo", distribuzione_tempo(M, 1 - fc, 1 - ft))):
+        ordine = sorted(((i, j, H[i, j]) for i in range(6) for j in range(6)), key=lambda z: -z[2])[:quanti]
+        riga = {"Tempo": nome}
+        for pos, (i, j, p) in enumerate(ordine):
+            riga[["Più probabile", "Seconda", "Terza"][pos]] = f"{i}-{j} ({p * 100:.0f}%)"
+        righe.append(riga)
+    return righe
+
+
+def tabella_esatti_tempi(res):
+    """Test a ritroso dei risultati esatti dei tempi: la quota di gol per tempo e le frequenze usano solo le partite precedenti del test. Confronta il modello con le frequenze."""
+    if res is None or "ht" not in res or "Ms" not in res or "Modello" not in res["Ms"]:
+        return pd.DataFrame()
+    M, ht, xs, ys = res["Ms"]["Modello"], res["ht"], res["xs"], res["ys"]
+    n, K = len(xs), 200.0
+    s1c = s1t = fc_tot = ft_tot = 0.0
+    c1, c2 = np.zeros((11, 11)), np.zeros((11, 11))
+    nprec = 0
+    L = {"1° tempo": ([], []), "2° tempo": ([], [])}
+    T = {"1° tempo": ([], [], [], []), "2° tempo": ([], [], [], [])}
+    for r in range(n):
+        if np.isnan(ht[r, 0]) or np.isnan(ht[r, 1]):
+            continue
+        a, b = int(min(ht[r, 0], 10)), int(min(ht[r, 1], 10))
+        x2, y2 = int(min(max(xs[r] - ht[r, 0], 0), 10)), int(min(max(ys[r] - ht[r, 1], 0), 10))
+        if nprec >= 150 and not np.isnan(M[r]).any():
+            fc, ft = (s1c + 0.44 * K) / (fc_tot + K), (s1t + 0.45 * K) / (ft_tot + K)
+            for nome, H, (u, v), cnt in (("1° tempo", distribuzione_tempo(M[r], fc, ft), (a, b), c1), ("2° tempo", distribuzione_tempo(M[r], 1 - fc, 1 - ft), (x2, y2), c2)):
+                Hn = H / H.sum()
+                fr = (cnt + 0.05) / (cnt.sum() + 0.05 * 121)
+                L[nome][0].append(-math.log(max(Hn[u, v], 1e-12)))
+                L[nome][1].append(-math.log(max(fr[u, v], 1e-12)))
+                piatto = np.argsort(Hn.ravel())[::-1][:3]
+                idx = u * 11 + v
+                T[nome][0].append(float(piatto[0] == idx))
+                T[nome][1].append(float(Hn.ravel()[piatto[0]]))
+                T[nome][2].append(float(idx in piatto))
+                T[nome][3].append(float(Hn.ravel()[piatto].sum()))
+        s1c += ht[r, 0]
+        s1t += ht[r, 1]
+        fc_tot += xs[r]
+        ft_tot += ys[r]
+        c1[a, b] += 1
+        c2[x2, y2] += 1
+        nprec += 1
+    righe = []
+    for nome in ("1° tempo", "2° tempo"):
+        Lm, Lf = np.array(L[nome][0]), np.array(L[nome][1])
+        if len(Lm) < 100:
+            continue
+        righe.append({"Tempo": nome, "Partite": len(Lm), "Modello": round(float(Lm.mean()), 4), "Frequenze": round(float(Lf.mean()), 4),
+                      "Modello − Frequenze (± err.)": _diff_se(Lm, Lf),
+                      "Primo esatto: preso %": round(float(np.mean(T[nome][0])) * 100, 1), "Primo esatto: prob. media %": round(float(np.mean(T[nome][1])) * 100, 1),
+                      "Primi 3: presi %": round(float(np.mean(T[nome][2])) * 100, 1), "Primi 3: prob. media %": round(float(np.mean(T[nome][3])) * 100, 1)})
+    return pd.DataFrame(righe)
+
+
 _NOMI_SCELTA = {"1": "1 (vince la casa)", "X": "X (pareggio)", "2": "2 (vince la trasferta)",
                 "1X": "1X (la casa non perde)", "X2": "X2 (la trasferta non perde)", "12": "12 (non pareggia)"}
 
@@ -2187,6 +2265,13 @@ def mostra_analisi(casa, trasf, data, ora):
         st.dataframe(pd.DataFrame(cf_righe).drop(columns=["_segno", "_modello"]), use_container_width=True, hide_index=True)
         st.caption("1 = più la casa, X = pari, 2 = più la trasferta; la percentuale è la probabilità di quel segno (sotto il 50% è un pronostico debole). Medie storiche reali delle due squadre (in casa o in trasferta e subite dall'avversario). "
                    "Non ci sono quote su questi mercati: sono indicazioni, non valore. ⚠️ = nel test a ritroso il modello non batte abbastanza le sole frequenze, quindi uso la frequenza storica del campionato.")
+    es_tempi = esatti_per_tempo(d["M_gol"], df_storico)
+    if es_tempi:
+        st.markdown("#### ⏱️ Risultato esatto per tempo")
+        st.dataframe(pd.DataFrame(es_tempi), use_container_width=True, hide_index=True)
+        st.caption("I gol del punteggio finale sono distribuiti tra i due tempi con la quota storica del campionato (casa e trasferta separate). "
+                   "Il risultato esatto di un tempo resta molto incerto: guarda la percentuale, non solo il segno. Nessuna quota su questo mercato: sono indicazioni, non valore. "
+                   "La calibrazione si controlla nel test completo del Backtest.")
     with st.expander("🎯 Tutti i pronostici e le combo", expanded=False):
         pp = pr["p"]
         st.markdown("#### 🎯 Il pronostico")
@@ -2677,7 +2762,7 @@ def esegui_test_campionato(div, giorno):
     if res is None:
         return None
     tab_a, tab_b, tab_c, tab_d, tab_e, best_ex, tab_cal, tab_roi, tab_tempi = tabelle_test(res, pesi_)
-    return {"tabelle": [tab_a, tab_cal, tab_tempi, tab_roi, tab_b, tab_c, tab_d, tab_e], "tempi_stagione": tabella_tempi_per_stagione(df), "punteggi_bassi": tabella_punteggi_bassi(res), "chi_di_piu": test_chi_fa_di_piu(df), "taratura_chi": taratura_chi_fa_di_piu(df)}
+    return {"tabelle": [tab_a, tab_cal, tab_tempi, tab_roi, tab_b, tab_c, tab_d, tab_e], "tempi_stagione": tabella_tempi_per_stagione(df), "punteggi_bassi": tabella_punteggi_bassi(res), "chi_di_piu": test_chi_fa_di_piu(df), "taratura_chi": taratura_chi_fa_di_piu(df), "esatti_tempi": tabella_esatti_tempi(res)}
 
 
 def _cella_cal(cal, mercato, fonte, fascia):
@@ -2732,6 +2817,9 @@ def zip_test_campionati(risultati):
             if ch_ is not None:
                 z.writestr(f"{cartella}/11_chi_fa_di_piu_log_score.csv", "\ufeff" + ch_[0].to_csv(index=False))
                 z.writestr(f"{cartella}/12_chi_fa_di_piu_calibrazione.csv", "\ufeff" + ch_[1].to_csv(index=False))
+            et_ = r.get("esatti_tempi")
+            if et_ is not None and not et_.empty:
+                z.writestr(f"{cartella}/14_esatti_per_tempo.csv", "\ufeff" + et_.to_csv(index=False))
             ta_ = r.get("taratura_chi")
             if ta_ is not None:
                 z.writestr(f"{cartella}/13_taratura_chi_fa_di_piu.csv", "\ufeff" + ta_.to_csv(index=False))
@@ -2881,6 +2969,12 @@ with tab_backtest:
             st.dataframe(tab_pb, use_container_width=True, hide_index=True)
             st.caption("Controllo, non cambia nessuna previsione. Reale contro previsto dal modello nel test a ritroso. Differenza positiva = il modello prevede più punteggi bassi di quanti ne escono. "
                        "'± err.' è l'errore statistico: differenze entro circa 2 volte quel valore possono essere rumore. L'ultima stagione è parziale.")
+        tab_et = tabella_esatti_tempi(tc)
+        if not tab_et.empty:
+            st.markdown("#### ⏱️ Risultati esatti dei tempi")
+            st.dataframe(tab_et, use_container_width=True, hide_index=True)
+            st.caption("Test a ritroso: la quota di gol per tempo e le frequenze usano solo le partite precedenti. Log score: più basso è meglio; 'Primo esatto' è quante volte il risultato più probabile è uscito davvero, "
+                       "'Primi 3' quante volte è uscito uno dei tre più probabili, ognuno accanto alla probabilità media che il modello aveva dato.")
 
     st.markdown("---")
     st.markdown("### 🌍 Test completo su tutti i campionati")
