@@ -1634,6 +1634,8 @@ CHI_STAT = [("Tiri", "HS", "AS"), ("Tiri in porta", "HST", "AST"), ("Corner", "H
 # k = partite virtuali verso la media del campionato; fattore = correzione della sovradispersione stimata.
 CHI_K = {"Tiri": 2, "Tiri in porta": 2, "Corner": 5, "Ammonizioni": 5}
 CHI_SCALA_PHI = {"Tiri": 0.7, "Tiri in porta": 0.7, "Corner": 1.0, "Ammonizioni": 1.0}
+# Quota di ammonizioni e di corner che cade nel 1° tempo: ASSUNTA, non misurata (football-data non ha i dati per tempo). La raccolta con API-Football serve a misurarla.
+CHI_QUOTA_1T = {"Ammonizioni": 0.38, "Corner": 0.45}
 
 
 def _prob_piu_di(mu_h, mu_a, phi):
@@ -1753,7 +1755,7 @@ def parametri_chi_fa_di_piu(div, giorno):
 def chi_fa_di_piu(df, casa, trasf, par):
     """Righe per la scheda partita: chi avrà di più per tiri, tiri in porta, angoli e ammonizioni (con il pareggio). Se nel test a ritroso il modello non batte
     le frequenze di almeno 0.02 di log score (z ≤ −2), le percentuali sono le frequenze storiche del campionato e lo dice."""
-    righe = []
+    righe, medie = [], {}
     for nome, h, a in CHI_STAT:
         if h not in df.columns or a not in df.columns or nome not in par:
             continue
@@ -1771,9 +1773,23 @@ def chi_fa_di_piu(df, casa, trasf, par):
         else:
             pc, pp_, pt = float((d[h] > d[a]).mean()), float((d[h] == d[a]).mean()), float((d[h] < d[a]).mean())
         segno, ps = _segno_chi(pc, pp_, pt)
+        medie[nome] = (mh, ma, lega_h, lega_a, ok_modello, par[nome]["phi"] * CHI_SCALA_PHI[nome])
         righe.append({"Statistica": nome, "Attesi (casa - trasf.)": f"{mh:.1f} - {ma:.1f}", "Casa di più %": round(pc * 100, 1), "Pari %": round(pp_ * 100, 1),
                       "Trasferta di più %": round(pt * 100, 1), "Segno": f"{segno} ({ps * 100:.0f}%)",
                       "Basato su": "✅ modello (batte le frequenze)" if ok_modello else "⚠️ solo frequenza storica del campionato", "_segno": segno, "_modello": ok_modello})
+    # per tempo: la quota di eventi per tempo è assunta (CHI_QUOTA_1T), quindi non verificata
+    for nome, q in CHI_QUOTA_1T.items():
+        if nome not in medie:
+            continue
+        mh, ma, lega_h, lega_a, ok_modello, phi_eff = medie[nome]
+        for tempo, qq in (("1° tempo", q), ("2° tempo", 1 - q)):
+            m1, m2 = (mh * qq, ma * qq) if ok_modello else (lega_h * qq, lega_a * qq)
+            pc, pp_, pt = _prob_piu_di(m1, m2, phi_eff)
+            segno, ps = _segno_chi(pc, pp_, pt)
+            righe.append({"Statistica": f"{nome} {tempo}", "Attesi (casa - trasf.)": f"{m1:.1f} - {m2:.1f}", "Casa di più %": round(pc * 100, 1), "Pari %": round(pp_ * 100, 1),
+                          "Trasferta di più %": round(pt * 100, 1), "Segno": f"{segno} ({ps * 100:.0f}%)",
+                          "Basato su": f"⚠️ stima non verificata: assumo che il {qq * 100:.0f}% cada nel {tempo}" + ("" if ok_modello else " e uso le medie del campionato"),
+                          "_segno": segno, "_modello": False, "_tempo": True})
     return righe
 
 
@@ -1910,6 +1926,80 @@ def tabella_esatti_tempi(res):
                       "Primo esatto: preso %": round(float(np.mean(T[nome][0])) * 100, 1), "Primo esatto: prob. media %": round(float(np.mean(T[nome][1])) * 100, 1),
                       "Primi 3: presi %": round(float(np.mean(T[nome][2])) * 100, 1), "Primi 3: prob. media %": round(float(np.mean(T[nome][3])) * 100, 1)})
     return pd.DataFrame(righe)
+
+
+# ======================= ESITO 1° TEMPO / FINALE (HT/FT) =======================
+# Dalla matrice dei punteggi finali e dalla quota di gol per tempo (casa e trasferta separate) si ricava la probabilità dei 9 esiti: segno al riposo e segno al 90°.
+# Stessa assunzione dei risultati esatti per tempo: ogni gol cade nel 1° tempo con la quota storica. Nessuna quota storica su questo mercato: sono indicazioni, non valore.
+_SEGNI_HT = ("1", "X", "2")
+
+
+def distribuzione_htft(M, f_casa, f_trasf):
+    """Matrice 3×3 delle probabilità [segno al riposo][segno finale] con segni nell'ordine 1, X, 2."""
+    n = M.shape[0]
+    k = np.arange(n)
+    Bc = binom.pmf(k[None, :], k[:, None], f_casa)
+    Bt = binom.pmf(k[None, :], k[:, None], f_trasf)
+    T = M[:, :, None, None] * Bc[:, None, :, None] * Bt[None, :, None, :]
+    segno = np.where(k[:, None] > k[None, :], 0, np.where(k[:, None] == k[None, :], 1, 2))
+    P = np.zeros((3, 3))
+    for h in range(3):
+        for f in range(3):
+            P[h, f] = T[(segno == f)[:, :, None, None] & (segno == h)[None, None, :, :]].sum()
+    return P / P.sum()
+
+
+def htft_per_scheda(M, df):
+    """Righe per la scheda partita: i 9 esiti 1° tempo/finale con probabilità e quota minima (quota equa). None se mancano i dati dei tempi."""
+    if df is None or "HTHG" not in df.columns or "HTAG" not in df.columns:
+        return None
+    d = df.dropna(subset=["HTHG", "HTAG"])
+    if len(d) < 100 or d["FTHG"].sum() == 0 or d["FTAG"].sum() == 0:
+        return None
+    P = distribuzione_htft(M, float(d["HTHG"].sum() / d["FTHG"].sum()), float(d["HTAG"].sum() / d["FTAG"].sum()))
+    righe = [{"Esito (riposo-finale)": f"{_SEGNI_HT[h]}-{_SEGNI_HT[f]}", "Probabilità %": round(float(P[h, f]) * 100, 1), "Quota minima": round(1 / max(float(P[h, f]), 1e-6), 2)}
+             for h in range(3) for f in range(3)]
+    return sorted(righe, key=lambda r: -r["Probabilità %"])
+
+
+def tabella_htft(res):
+    """Test a ritroso dell'esito 1° tempo/finale: la quota di gol per tempo e le frequenze usano solo le partite precedenti del test.
+    Ritorna (tabella log score, tabella calibrazione per esito) oppure None."""
+    if res is None or "ht" not in res or "Ms" not in res or "Modello" not in res["Ms"]:
+        return None
+    M, ht, xs, ys = res["Ms"]["Modello"], res["ht"], res["xs"], res["ys"]
+    n, K = len(xs), 200.0
+    s1c = s1t = fc_tot = ft_tot = 0.0
+    cnt = np.ones((3, 3))
+    Lm, Lf, prev, reali = [], [], [], []
+    nprec = 0
+    for r in range(n):
+        if np.isnan(ht[r, 0]) or np.isnan(ht[r, 1]):
+            continue
+        h = 0 if ht[r, 0] > ht[r, 1] else (1 if ht[r, 0] == ht[r, 1] else 2)
+        f = 0 if xs[r] > ys[r] else (1 if xs[r] == ys[r] else 2)
+        if nprec >= 150 and not np.isnan(M[r]).any():
+            fc, ft = (s1c + 0.44 * K) / (fc_tot + K), (s1t + 0.45 * K) / (ft_tot + K)
+            P = distribuzione_htft(M[r], fc, ft)
+            Lm.append(-math.log(max(P[h, f], 1e-12)))
+            Lf.append(-math.log((cnt / cnt.sum())[h, f]))
+            prev.append(P.ravel())
+            reali.append(h * 3 + f)
+        s1c += ht[r, 0]
+        s1t += ht[r, 1]
+        fc_tot += xs[r]
+        ft_tot += ys[r]
+        cnt[h, f] += 1
+        nprec += 1
+    if len(Lm) < 100:
+        return None
+    Lm, Lf, prev, reali = np.array(Lm), np.array(Lf), np.array(prev), np.array(reali)
+    tab = pd.DataFrame([{"Partite": len(Lm), "Modello": round(float(Lm.mean()), 4), "Frequenze": round(float(Lf.mean()), 4), "Modello − Frequenze (± err.)": _diff_se(Lm, Lf),
+                         "Esito più probabile: preso %": round(float((prev.argmax(axis=1) == reali).mean()) * 100, 1),
+                         "Esito più probabile: prob. media %": round(float(prev.max(axis=1).mean()) * 100, 1)}])
+    cal = pd.DataFrame([{"Esito (riposo-finale)": f"{_SEGNI_HT[k // 3]}-{_SEGNI_HT[k % 3]}", "Previsto %": round(float(prev[:, k].mean()) * 100, 1),
+                         "Reale %": round(float((reali == k).mean()) * 100, 1), "Differenza (punti)": round((float(prev[:, k].mean()) - float((reali == k).mean())) * 100, 1)} for k in range(9)])
+    return tab, cal
 
 
 _NOMI_SCELTA = {"1": "1 (vince la casa)", "X": "X (pareggio)", "2": "2 (vince la trasferta)",
@@ -2229,8 +2319,8 @@ if fx is not None:
             })
 df_value = pd.DataFrame(righe_val)  # tutte le selezioni (3 per partita)
 
-tab_calendario, tab_pronostici, tab_classifica, tab_value_finder, tab_ai_schedine, tab_monte_carlo, tab_backtest, tab_kelly, tab_coppe = st.tabs([
-    "📅 Calendario", "📋 Pronostici", "🏆 Classifica", "⚡ Value Finder", "🤖 Schedine AI", "🎲 Monte Carlo", "🧪 Backtest", "🧮 Value Bet", "🌍 Coppe",
+tab_calendario, tab_pronostici, tab_classifica, tab_value_finder, tab_ai_schedine, tab_monte_carlo, tab_backtest, tab_kelly, tab_coppe, tab_giocatori = st.tabs([
+    "📅 Calendario", "📋 Pronostici", "🏆 Classifica", "⚡ Value Finder", "🤖 Schedine AI", "🎲 Monte Carlo", "🧪 Backtest", "🧮 Value Bet", "🌍 Coppe", "👤 Giocatori",
 ])
 
 
@@ -2261,10 +2351,14 @@ def mostra_analisi(casa, trasf, data, ora):
     cf_righe = chi_fa_di_piu(df_storico, casa, trasf, parametri_chi_fa_di_piu(div, giorno))
     if cf_righe:
         st.markdown("#### ⚔️ Chi farà di più")
-        st.markdown("**In breve:** " + " · ".join(f"{r['Statistica']} **{r['Segno']}**" + ("" if r["_modello"] else " ⚠️") for r in cf_righe))
-        st.dataframe(pd.DataFrame(cf_righe).drop(columns=["_segno", "_modello"]), use_container_width=True, hide_index=True)
+        st.markdown("**In breve:** " + " · ".join(f"{r['Statistica']} **{r['Segno']}**" + ("" if r["_modello"] else " ⚠️") for r in cf_righe if not r.get("_tempo")))
+        _r_tempo = [r for r in cf_righe if r.get("_tempo")]
+        if _r_tempo:
+            st.markdown("**Per tempo (stima non verificata):** " + " · ".join(f"{r['Statistica']} **{r['Segno']}**" for r in _r_tempo))
+        st.dataframe(pd.DataFrame(cf_righe).drop(columns=["_segno", "_modello", "_tempo"], errors="ignore"), use_container_width=True, hide_index=True)
         st.caption("1 = più la casa, X = pari, 2 = più la trasferta; la percentuale è la probabilità di quel segno (sotto il 50% è un pronostico debole). Medie storiche reali delle due squadre (in casa o in trasferta e subite dall'avversario). "
-                   "Non ci sono quote su questi mercati: sono indicazioni, non valore. ⚠️ = nel test a ritroso il modello non batte abbastanza le sole frequenze, quindi uso la frequenza storica del campionato.")
+                   "Non ci sono quote su questi mercati: sono indicazioni, non valore. ⚠️ = nel test a ritroso il modello non batte abbastanza le sole frequenze, quindi uso la frequenza storica del campionato. "
+                   "Le righe per tempo (ammonizioni e corner) usano una quota per tempo ASSUNTA (38% e 45% nel 1° tempo), non misurata: nel 1° tempo il pareggio pesa molto e le percentuali sono incerte.")
     es_tempi = esatti_per_tempo(d["M_gol"], df_storico)
     if es_tempi:
         st.markdown("#### ⏱️ Risultato esatto per tempo")
@@ -2272,6 +2366,12 @@ def mostra_analisi(casa, trasf, data, ora):
         st.caption("I gol del punteggio finale sono distribuiti tra i due tempi con la quota storica del campionato (casa e trasferta separate). "
                    "Il risultato esatto di un tempo resta molto incerto: guarda la percentuale, non solo il segno. Nessuna quota su questo mercato: sono indicazioni, non valore. "
                    "La calibrazione si controlla nel test completo del Backtest.")
+    htft_s = htft_per_scheda(d["M_gol"], df_storico)
+    if htft_s:
+        st.markdown("#### ⏱️ Esito 1° tempo / Finale")
+        st.dataframe(pd.DataFrame(htft_s), use_container_width=True, hide_index=True)
+        st.caption("Segno al riposo e segno finale (per esempio X-2: pari all'intervallo e vince la trasferta). Si ricava dal risultato finale e dalla quota storica di gol per tempo. "
+                   "'Quota minima' è la quota equa del modello: sotto quella quota non vale la pena. Nessuna quota storica su questo mercato per verificare il modello: indicazioni, non valore.")
     with st.expander("🎯 Tutti i pronostici e le combo", expanded=False):
         pp = pr["p"]
         st.markdown("#### 🎯 Il pronostico")
@@ -2762,7 +2862,7 @@ def esegui_test_campionato(div, giorno):
     if res is None:
         return None
     tab_a, tab_b, tab_c, tab_d, tab_e, best_ex, tab_cal, tab_roi, tab_tempi = tabelle_test(res, pesi_)
-    return {"tabelle": [tab_a, tab_cal, tab_tempi, tab_roi, tab_b, tab_c, tab_d, tab_e], "tempi_stagione": tabella_tempi_per_stagione(df), "punteggi_bassi": tabella_punteggi_bassi(res), "chi_di_piu": test_chi_fa_di_piu(df), "taratura_chi": taratura_chi_fa_di_piu(df), "esatti_tempi": tabella_esatti_tempi(res)}
+    return {"tabelle": [tab_a, tab_cal, tab_tempi, tab_roi, tab_b, tab_c, tab_d, tab_e], "tempi_stagione": tabella_tempi_per_stagione(df), "punteggi_bassi": tabella_punteggi_bassi(res), "chi_di_piu": test_chi_fa_di_piu(df), "taratura_chi": taratura_chi_fa_di_piu(df), "esatti_tempi": tabella_esatti_tempi(res), "htft": tabella_htft(res)}
 
 
 def _cella_cal(cal, mercato, fonte, fascia):
@@ -2817,6 +2917,10 @@ def zip_test_campionati(risultati):
             if ch_ is not None:
                 z.writestr(f"{cartella}/11_chi_fa_di_piu_log_score.csv", "\ufeff" + ch_[0].to_csv(index=False))
                 z.writestr(f"{cartella}/12_chi_fa_di_piu_calibrazione.csv", "\ufeff" + ch_[1].to_csv(index=False))
+            hf_ = r.get("htft")
+            if hf_ is not None:
+                z.writestr(f"{cartella}/15_htft_log_score.csv", "\ufeff" + hf_[0].to_csv(index=False))
+                z.writestr(f"{cartella}/16_htft_calibrazione.csv", "\ufeff" + hf_[1].to_csv(index=False))
             et_ = r.get("esatti_tempi")
             if et_ is not None and not et_.empty:
                 z.writestr(f"{cartella}/14_esatti_per_tempo.csv", "\ufeff" + et_.to_csv(index=False))
@@ -2975,6 +3079,12 @@ with tab_backtest:
             st.dataframe(tab_et, use_container_width=True, hide_index=True)
             st.caption("Test a ritroso: la quota di gol per tempo e le frequenze usano solo le partite precedenti. Log score: più basso è meglio; 'Primo esatto' è quante volte il risultato più probabile è uscito davvero, "
                        "'Primi 3' quante volte è uscito uno dei tre più probabili, ognuno accanto alla probabilità media che il modello aveva dato.")
+        out_hf = tabella_htft(tc)
+        if out_hf is not None:
+            st.markdown("#### ⏱️ Esito 1° tempo / Finale")
+            st.dataframe(out_hf[0], use_container_width=True, hide_index=True)
+            st.dataframe(out_hf[1], use_container_width=True, hide_index=True)
+            st.caption("Test a ritroso sui 9 esiti. La seconda tabella confronta, per ogni esito, la probabilità media prevista con quanto è uscito davvero.")
 
     st.markdown("---")
     st.markdown("### 🌍 Test completo su tutti i campionati")
@@ -3492,6 +3602,114 @@ def diagnosi_api_football(chiave, id_lega, anno):
     return out
 
 
+LEGHE_API_FOOTBALL = {"Serie A": 135, "Premier League": 39, "La Liga": 140, "Bundesliga": 78, "Ligue 1": 61, "Eredivisie": 88}  # codici di API-Football; il nome restituito li conferma
+
+
+def partite_finite_api_football(chiave, id_lega, anno):
+    """Elenco delle partite finite di un campionato (1 richiesta). Ritorna (partite, nome del campionato trovato, errori)."""
+    js, lim, err = api_football_get(chiave, "fixtures", {"league": id_lega, "season": anno, "status": "FT"})
+    errori = [err] if err else []
+    if isinstance(js, dict) and js.get("errors"):
+        errs = js["errors"]
+        errori += [f"{k}: {v}" for k, v in (errs.items() if isinstance(errs, dict) else enumerate(errs))]
+    righe, nome = [], None
+    for it in (js or {}).get("response") or []:
+        fx_, tm = it.get("fixture") or {}, it.get("teams") or {}
+        nome = nome or (it.get("league") or {}).get("name")
+        righe.append({"id": fx_.get("id"), "data": str(fx_.get("date") or "")[:10], "casa_id": (tm.get("home") or {}).get("id"), "casa": (tm.get("home") or {}).get("name"),
+                      "trasf_id": (tm.get("away") or {}).get("id"), "trasf": (tm.get("away") or {}).get("name")})
+    return righe, nome, errori
+
+
+def cartellini_per_tempo(chiave, partita):
+    """Ammonizioni e rossi di una partita divisi per tempo e per squadra, dagli eventi (1 richiesta). Ritorna (conteggi, errore, intestazioni sui limiti).
+    1° tempo = fino al 45° minuto (recupero compreso), 2° tempo = dal 46° in poi."""
+    js, lim, err = api_football_get(chiave, "fixtures/events", {"fixture": partita["id"]})
+    if err or not isinstance(js, dict):
+        return None, err or "risposta non valida", lim
+    if js.get("errors"):
+        return None, str(js["errors"]), lim
+    c = {f"{t}{h}_{l}": 0 for t in "gr" for h in "12" for l in "ct"}
+    for ev in js.get("response") or []:
+        if ev.get("type") != "Card":
+            continue
+        minuto = (ev.get("time") or {}).get("elapsed")
+        squadra = (ev.get("team") or {}).get("id")
+        det = str(ev.get("detail") or "")
+        if minuto is None or squadra not in (partita["casa_id"], partita["trasf_id"]):
+            continue
+        tipo = "g" if "Yellow" in det else ("r" if "Red" in det else None)
+        if tipo:
+            c[f"{tipo}{'1' if minuto <= 45 else '2'}_{'c' if squadra == partita['casa_id'] else 't'}"] += 1
+    return c, None, lim
+
+
+# ======================= GIOCATORI (STUDIO): CARTELLINI, FALLI, TIRI =======================
+# Dalle statistiche di stagione di API-Football: tasso per 90 minuti di ogni giocatore, ridotto verso la media del ruolo, per i minuti medi a partita.
+# È uno studio: non ci sono quote né storico per verificarlo, la formazione non è nota e l'arbitro non è considerato.
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def squadre_api_football(_chiave, id_lega, anno):
+    """Squadre di un campionato in una stagione (1 richiesta). Ritorna (squadre, errori)."""
+    js, lim, err = api_football_get(_chiave, "teams", {"league": id_lega, "season": anno})
+    errori = [err] if err else []
+    if isinstance(js, dict) and js.get("errors"):
+        errs = js["errors"]
+        errori += [f"{k}: {v}" for k, v in (errs.items() if isinstance(errs, dict) else enumerate(errs))]
+    righe = [{"id": (it.get("team") or {}).get("id"), "nome": (it.get("team") or {}).get("name")} for it in (js or {}).get("response") or []]
+    return sorted([r for r in righe if r["id"]], key=lambda r: r["nome"] or ""), errori
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def giocatori_squadra_api_football(_chiave, id_squadra, id_lega, anno):
+    """Statistiche di stagione dei giocatori di una squadra in un campionato (2-3 richieste, a pagine). Ritorna (righe, errori)."""
+    righe, errori, pag, tot = [], [], 1, 1
+    while pag <= min(tot, 4):
+        js, lim, err = api_football_get(_chiave, "players", {"team": id_squadra, "league": id_lega, "season": anno, "page": pag})
+        if err or not isinstance(js, dict):
+            errori.append(err or "risposta non valida")
+            break
+        if js.get("errors"):
+            errs = js["errors"]
+            errori += [f"{k}: {v}" for k, v in (errs.items() if isinstance(errs, dict) else enumerate(errs))]
+            break
+        tot = (js.get("paging") or {}).get("total", 1) or 1
+        for it in js.get("response") or []:
+            pl = it.get("player") or {}
+            sts = [s_ for s_ in (it.get("statistics") or []) if (s_.get("league") or {}).get("id") == id_lega] or (it.get("statistics") or [])[:1]
+            if not sts:
+                continue
+            s_ = sts[0]
+            g = s_.get("games") or {}
+            righe.append({"giocatore": pl.get("name"), "ruolo": g.get("position") or "N/D", "presenze": g.get("appearences") or 0, "titolare": g.get("lineups") or 0,
+                          "minuti": g.get("minutes") or 0, "gialli": (s_.get("cards") or {}).get("yellow") or 0, "rossi": (s_.get("cards") or {}).get("red") or 0,
+                          "falli_commessi": (s_.get("fouls") or {}).get("committed") or 0, "falli_subiti": (s_.get("fouls") or {}).get("drawn") or 0,
+                          "tiri": (s_.get("shots") or {}).get("total") or 0, "tiri_porta": (s_.get("shots") or {}).get("on") or 0})
+        pag += 1
+    return righe, errori
+
+
+def stima_giocatori(righe, minuti_virtuali=450.0, minuti_minimi=180):
+    """Probabilità, per ogni giocatore, di un evento nella partita se gioca i suoi minuti medi: tasso per 90' ridotto verso la media del ruolo con 'minuti_virtuali',
+    poi Poisson. Ritorna un DataFrame (vuoto se non ci sono giocatori con abbastanza minuti)."""
+    df = pd.DataFrame(righe)
+    if df.empty:
+        return df
+    df = df[df["minuti"] >= minuti_minimi].copy()
+    if df.empty:
+        return df
+    for col, nome in (("gialli", "cart90"), ("falli_commessi", "fc90"), ("falli_subiti", "fs90"), ("tiri", "ti90"), ("tiri_porta", "tp90")):
+        prior = df.groupby("ruolo")[col].transform("sum") / df.groupby("ruolo")["minuti"].transform("sum") * 90
+        df[nome] = (df[col] + prior * minuti_virtuali / 90) / (df["minuti"] / 90 + minuti_virtuali / 90)
+    f = (df["minuti"] / df["presenze"].clip(lower=1)).clip(20, 90) / 90
+    atteso = lambda c: df[c] * f
+    out = pd.DataFrame({"Giocatore": df["giocatore"], "Ruolo": df["ruolo"], "Presenze": df["presenze"].astype(int), "Da titolare %": (100 * df["titolare"] / df["presenze"].clip(lower=1)).round(0),
+                        "Minuti a partita": (f * 90).round(0), "Cartellini ogni 90'": df["cart90"].round(2),
+                        "Cartellino %": (100 * (1 - np.exp(-atteso("cart90")))).round(0), "Falli commessi ≥1 %": (100 * (1 - np.exp(-atteso("fc90")))).round(0),
+                        "Falli subiti ≥1 %": (100 * (1 - np.exp(-atteso("fs90")))).round(0), "Tiri ≥1 %": (100 * (1 - poisson.cdf(0, atteso("ti90")))).round(0),
+                        "Tiri ≥3 %": (100 * (1 - poisson.cdf(2, atteso("ti90")))).round(0), "Tiri in porta ≥1 %": (100 * (1 - poisson.cdf(0, atteso("tp90")))).round(0)})
+    return out.sort_values("Cartellino %", ascending=False).reset_index(drop=True)
+
+
 # ======================= TAB COPPE EUROPEE =======================
 with tab_coppe:
     st.markdown("### 🌍 Coppe europee — solo previsione")
@@ -3533,6 +3751,49 @@ with tab_coppe:
                     st.caption("Tipi che ci interessano: " + ", ".join(t for t in dg["tipi_scommessa"] if any(k in t.lower() for k in _kw)))
                 st.download_button("⬇ Scarica la diagnosi (JSON, senza la chiave)", data=json.dumps(dg, indent=2, ensure_ascii=False, default=str),
                                    file_name=f"diagnosi_api_football_{giorno}.json", mime="application/json", key="apif_dl")
+            st.markdown("**📥 Raccolta cartellini per tempo** — dati veri per misurare quanti cartellini cadono nel 1° e nel 2° tempo")
+            st.caption("Per ogni partita finita serve 1 richiesta (più 1 per l'elenco). Scarica a blocchi: nel piano gratuito hai 100 richieste al giorno. "
+                       "Poi scarichi il CSV e lo ricarichi qui per continuare il giorno dopo (o me lo mandi per l'analisi). Gli angoli per tempo non sono disponibili.")
+            rc1, rc2 = st.columns(2)
+            lega_r = rc1.selectbox("Campionato", list(LEGHE_API_FOOTBALL.keys()), key="racc_lega")
+            _oggi_r = date.today()
+            anno_r = int(rc2.number_input("Stagione (anno di inizio)", min_value=2015, max_value=_oggi_r.year, value=_oggi_r.year if _oggi_r.month >= 7 else _oggi_r.year - 1, key="racc_anno"))
+            blocco_r = st.slider("Partite da scaricare ora", 5, 90, 60, key="racc_n")
+            file_r = st.file_uploader("Continua da un file già scaricato (facoltativo)", type="csv", key="racc_file")
+            if st.button("📥 Scarica un blocco", key="racc_go"):
+                prec = pd.read_csv(file_r) if file_r is not None else st.session_state.get("racc_df", pd.DataFrame())
+                fatte = set(prec["id"].astype(int)) if not prec.empty and "id" in prec.columns else set()
+                with st.spinner("Elenco delle partite..."):
+                    elenco, nome_r, err_r = partite_finite_api_football(chiave_apif, LEGHE_API_FOOTBALL[lega_r], anno_r)
+                if err_r:
+                    st.warning("L'API ha risposto con avvisi: " + "; ".join(err_r))
+                if not elenco:
+                    st.info("Nessuna partita finita restituita per questa stagione.")
+                else:
+                    st.write(f"Campionato trovato: **{nome_r}** — {len(elenco)} partite finite, {len(fatte)} già raccolte.")
+                    da_fare = [x for x in elenco if x["id"] not in fatte][:blocco_r]
+                    barra_r, nuove, errori_r = st.progress(0.0), [], []
+                    for i_, pt_ in enumerate(da_fare):
+                        cnt, e_, lim_ = cartellini_per_tempo(chiave_apif, pt_)
+                        if cnt is None:
+                            errori_r.append(f"{pt_['casa']}-{pt_['trasf']}: {e_}")
+                            if len(errori_r) >= 3:
+                                break
+                        else:
+                            nuove.append({**{k: pt_[k] for k in ("id", "data", "casa", "trasf")}, "campionato": lega_r, "stagione": anno_r, **cnt})
+                        barra_r.progress((i_ + 1) / max(len(da_fare), 1))
+                        rest_min = next((int(v) for k, v in lim_.items() if k.lower() == "x-ratelimit-remaining" and str(v).isdigit()), None)
+                        time.sleep(61 if rest_min is not None and rest_min <= 1 else 0.2)
+                    barra_r.empty()
+                    st.session_state["racc_df"] = pd.concat([prec, pd.DataFrame(nuove)], ignore_index=True) if nuove else prec
+                    if errori_r:
+                        st.warning("Mi fermo per errori ripetuti: " + "; ".join(errori_r[:3]))
+            racc = st.session_state.get("racc_df", pd.DataFrame())
+            if not racc.empty:
+                g1 = racc[[c for c in racc.columns if c.startswith("g1_")]].to_numpy().sum()
+                g2 = racc[[c for c in racc.columns if c.startswith("g2_")]].to_numpy().sum()
+                st.write(f"**Raccolte {len(racc)} partite.** Ammonizioni: {int(g1)} nel 1° tempo e {int(g2)} nel 2° ({g1 / max(g1 + g2, 1) * 100:.1f}% nel 1° tempo; la stima usata nell'app è 38%).")
+                st.download_button("⬇ Scarica il CSV raccolto", data=racc.to_csv(index=False), file_name=f"cartellini_per_tempo_{giorno}.csv", mime="text/csv", key="racc_dl")
     df_c, mancanti_c = carica_storico_coppa(coppa, giorno)
     if df_c is None:
         st.error("Non riesco a scaricare i dati delle coppe (openfootball). Riprova tra poco.")
@@ -3621,3 +3882,49 @@ with tab_coppe:
                 st.dataframe(fut_c[["Date", "HomeTeam", "AwayTeam", "Fase"]], use_container_width=True, hide_index=True)
         else:
             st.caption("La fonte non ha ancora il calendario della stagione in corso: scegli le due squadre a mano.")
+
+
+# ======================= TAB GIOCATORI (STUDIO) =======================
+with tab_giocatori:
+    st.markdown("### 👤 Giocatori — studio (cartellini, falli, tiri)")
+    st.caption("Stime dalle statistiche di stagione di API-Football: tasso per 90 minuti di ogni giocatore, ridotto verso la media del ruolo, per i minuti medi a partita. "
+               "È uno studio: non ci sono quote né storico per verificarlo, la formazione non è nota (le percentuali valgono se il giocatore gioca i suoi minuti medi) "
+               "e l'arbitro non è considerato. Sono indicazioni, non valore. Ogni partita costa circa 5-7 richieste (le stesse squadre restano in memoria 24 ore).")
+    if not chiave_apif:
+        st.info("Inserisci la chiave API-Football nella barra laterale (gratis su api-football.com, in Account → My Access).")
+    else:
+        gc1, gc2 = st.columns(2)
+        lega_g = gc1.selectbox("Campionato", list(LEGHE_API_FOOTBALL.keys()), key="gioc_lega")
+        _oggi_g = date.today()
+        anno_g = int(gc2.number_input("Stagione (anno di inizio)", min_value=2015, max_value=_oggi_g.year, value=_oggi_g.year if _oggi_g.month >= 7 else _oggi_g.year - 1, key="gioc_anno"))
+        squadre_g, err_g = squadre_api_football(chiave_apif, LEGHE_API_FOOTBALL[lega_g], anno_g)
+        if err_g:
+            st.warning("L'API ha risposto con avvisi (di solito dicono cosa non è incluso nel piano): " + "; ".join(err_g))
+        if not squadre_g:
+            st.info("Nessuna squadra restituita per questo campionato e questa stagione.")
+        else:
+            nomi_g = [x["nome"] for x in squadre_g]
+            id_g = {x["nome"]: x["id"] for x in squadre_g}
+            gs1, gs2 = st.columns(2)
+            casa_g = gs1.selectbox("Casa", nomi_g, key="gioc_casa")
+            trasf_g = gs2.selectbox("Trasferta", [n_ for n_ in nomi_g if n_ != casa_g], key="gioc_trasf")
+            if st.button("👤 Carica i giocatori", key="gioc_go"):
+                with st.spinner("Scarico le statistiche dei giocatori..."):
+                    dati_g, errori_g = {}, []
+                    for ruolo_, nome_ in (("Casa", casa_g), ("Trasferta", trasf_g)):
+                        righe_, e_ = giocatori_squadra_api_football(chiave_apif, id_g[nome_], LEGHE_API_FOOTBALL[lega_g], anno_g)
+                        errori_g += [f"{nome_}: {x}" for x in e_]
+                        dati_g[ruolo_] = (nome_, stima_giocatori(righe_))
+                st.session_state["gioc_dati"] = (dati_g, errori_g)
+            _gd = st.session_state.get("gioc_dati")
+            if _gd:
+                if _gd[1]:
+                    st.warning("Avvisi dell'API: " + "; ".join(_gd[1]))
+                for ruolo_, (nome_, tab_) in _gd[0].items():
+                    st.markdown(f"#### {ruolo_}: {nome_}")
+                    if tab_.empty:
+                        st.info("Nessun giocatore con abbastanza minuti (almeno 180) in questa stagione.")
+                    else:
+                        st.dataframe(tab_, use_container_width=True, hide_index=True)
+                st.caption("'Cartellino %' è la probabilità di almeno un cartellino se il giocatore gioca i suoi minuti medi (non conta il caso del suo sostituto). "
+                           "'Falli commessi/subiti ≥1' e 'Tiri ≥1 / ≥3' seguono la stessa logica. Con pochi minuti le stime sono ridotte verso la media del ruolo. Nessuna quota: indicazioni, non valore.")
