@@ -1632,7 +1632,7 @@ def _finestra_sopra_media(finestre, freq, nome):
 CHI_STAT = [("Tiri", "HS", "AS"), ("Tiri in porta", "HST", "AST"), ("Corner", "HC", "AC"), ("Ammonizioni", "HY", "AY")]
 # Parametri per statistica, scelti con il test di taratura (regola fissata in anticipo: migliora di almeno 2 errori standard in almeno 5 campionati su 5-6).
 # k = partite virtuali verso la media del campionato; fattore = correzione della sovradispersione stimata.
-CHI_K = {"Tiri": 2, "Tiri in porta": 2, "Corner": 5, "Ammonizioni": 5}
+CHI_K = {"Tiri": 1, "Tiri in porta": 1, "Corner": 5, "Ammonizioni": 5}
 CHI_SCALA_PHI = {"Tiri": 0.7, "Tiri in porta": 0.7, "Corner": 1.0, "Ammonizioni": 1.0}
 # Quota di ammonizioni e di corner che cade nel 1° tempo: ASSUNTA, non misurata (football-data non ha i dati per tempo). La raccolta con API-Football serve a misurarla.
 CHI_QUOTA_1T = {"Ammonizioni": 0.38, "Corner": 0.45}
@@ -2359,18 +2359,18 @@ def mostra_analisi(casa, trasf, data, ora):
         st.caption("1 = più la casa, X = pari, 2 = più la trasferta; la percentuale è la probabilità di quel segno (sotto il 50% è un pronostico debole). Medie storiche reali delle due squadre (in casa o in trasferta e subite dall'avversario). "
                    "Non ci sono quote su questi mercati: sono indicazioni, non valore. ⚠️ = nel test a ritroso il modello non batte abbastanza le sole frequenze, quindi uso la frequenza storica del campionato. "
                    "Le righe per tempo (ammonizioni e corner) usano una quota per tempo ASSUNTA (38% e 45% nel 1° tempo), non misurata: nel 1° tempo il pareggio pesa molto e le percentuali sono incerte.")
-    es_tempi = esatti_per_tempo(d["M_gol"], df_storico)
+    es_tempi = esatti_per_tempo(d["M_es"], df_storico)
     if es_tempi:
         st.markdown("#### ⏱️ Risultato esatto per tempo")
         st.dataframe(pd.DataFrame(es_tempi), use_container_width=True, hide_index=True)
         st.caption("I gol del punteggio finale sono distribuiti tra i due tempi con la quota storica del campionato (casa e trasferta separate). "
                    "Il risultato esatto di un tempo resta molto incerto: guarda la percentuale, non solo il segno. Nessuna quota su questo mercato: sono indicazioni, non valore. "
                    "La calibrazione si controlla nel test completo del Backtest.")
-    htft_s = htft_per_scheda(d["M_gol"], df_storico)
+    htft_s = htft_per_scheda(d["M_1x2"], df_storico)
     if htft_s:
         st.markdown("#### ⏱️ Esito 1° tempo / Finale")
         st.dataframe(pd.DataFrame(htft_s), use_container_width=True, hide_index=True)
-        st.caption("Segno al riposo e segno finale (per esempio X-2: pari all'intervallo e vince la trasferta). Si ricava dal risultato finale e dalla quota storica di gol per tempo. "
+        st.caption("Segno al riposo e segno finale (per esempio X-2: pari all'intervallo e vince la trasferta). Si ricava dalla stessa distribuzione dell'1X2 mostrato sopra (i segni finali sommano le stesse percentuali) e dalla quota storica di gol per tempo. "
                    "'Quota minima' è la quota equa del modello: sotto quella quota non vale la pena. Nessuna quota storica su questo mercato per verificare il modello: indicazioni, non valore.")
     with st.expander("🎯 Tutti i pronostici e le combo", expanded=False):
         pp = pr["p"]
@@ -3168,7 +3168,7 @@ with tab_backtest:
             st.warning("Dati insufficienti per la taratura.")
         else:
             st.dataframe(_tara, use_container_width=True, hide_index=True)
-            st.caption("k = partite virtuali verso la media del campionato; fattore sulla dispersione. La differenza è dalla configurazione in uso (tiri e tiri in porta: k=2, fattore 0.7; angoli e ammonizioni: k=5, fattore 1.0): negativa = meglio. "
+            st.caption("k = partite virtuali verso la media del campionato; fattore sulla dispersione. La differenza è dalla configurazione in uso (tiri e tiri in porta: k=1, fattore 0.7; angoli e ammonizioni: k=5, fattore 1.0): negativa = meglio. "
                        "Regola fissata in anticipo: si adotta una variante solo se migliora di almeno 2 errori standard in almeno 5 campionati su 6.")
 
     st.markdown("---")
